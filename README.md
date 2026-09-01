@@ -8,12 +8,9 @@
 
 ---
 
-Press a hotkey, talk, press it again. UltraWhisper records your voice, turns it
-into text right on your Mac — no cloud, no account, no telemetry — types it
-into whatever you were doing, and puts your clipboard back the way it was.
-
-While you talk, a small floating card shows your voice as a live waveform.
-When you stop, it shows the text it heard, then fades away.
+Press a hotkey, talk, press it again. UltraWhisper turns your voice into text
+right on your Mac — no cloud, no account, no telemetry — and your clipboard
+comes back the way it was.
 
 ## Hotkeys
 
@@ -29,36 +26,31 @@ Change the keys in `~/.config/ultrawhisper/config.json`, then pick
 ## Install
 
 ```sh
-brew install ffmpeg whisper-cpp   # recorder + fallback engine
+brew install ffmpeg whisper-cpp
 ./download-model.sh               # main engine: Parakeet v3 (~650 MB)
-./download-model.sh base.en       # small whisper fallback model
-./build.sh                        # builds + installs /Applications/UltraWhisper.app
+./download-model.sh base.en       # small fallback model
+./build.sh                        # installs /Applications/UltraWhisper.app
 open -a UltraWhisper
 ```
 
-Transcription is NVIDIA Parakeet TDT v3 running locally — more accurate than
-whisper large-v3, and it answers in about a third of a second. If its files
-are missing, the app quietly falls back to whisper.cpp.
+Transcription is NVIDIA Parakeet TDT v3 running locally. If its files are
+missing, the app quietly falls back to whisper.cpp.
 
 ## First run
 
-macOS asks for two permissions. Grant both, or nothing works:
-
-1. **Accessibility** — lets the app hear the hotkey anywhere and press ⌘V for you.
-2. **Microphone** — appears the first time you record.
-
-Always launch with `open -a UltraWhisper` (or from Finder). Run the binary
-straight from a terminal and macOS hands the mic permission to the terminal
-instead of the app.
+Grant the two permissions macOS asks for: **Accessibility** (hear the hotkey,
+press ⌘V for you) and **Microphone**. Always launch with `open -a UltraWhisper`
+or from Finder — launched from a terminal, the mic permission lands on the
+terminal instead.
 
 ## Where things go
 
 | Thing | Where |
 |---|---|
-| Transcripts | `~/Dictation/YYYY-MM.md`, one line per take, owner-only files |
+| Transcripts | `~/Dictation/YYYY-MM.md`, one line per take |
 | Settings | `~/.config/ultrawhisper/config.json` |
-| Cleanup-mode LLM | `~/.config/ultrawhisper/.env` — local Ollama or xAI Grok, never OpenAI/Google/Anthropic |
-| Audio | a temp file, deleted the moment transcription finishes |
+| Cleanup-mode LLM | `~/.config/ultrawhisper/.env` — local Ollama or xAI Grok |
+| Audio | a temp file, deleted as soon as transcription finishes |
 
 The menu bar icon keeps your last 10 takes — click one to copy it.
 
@@ -68,8 +60,3 @@ The menu bar icon keeps your last 10 takes — click one to copy it.
 cp com.maxoleary.ultrawhisper.plist ~/Library/LaunchAgents/
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.maxoleary.ultrawhisper.plist
 ```
-
----
-
-Lives next to [Debrief](https://github.com/MaxOLeary/debrief), the local
-meeting-notes app — same rule everywhere: your voice never leaves your Mac.

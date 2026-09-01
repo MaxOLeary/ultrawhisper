@@ -171,7 +171,7 @@ struct Transcript {
     let text: String
 }
 
-// MARK: - Floating waveform panel (Superwhisper-style)
+// MARK: - Floating waveform panel
 
 /// What the card is currently showing.
 enum PanelState { case wave, discard, busy, result }
@@ -188,7 +188,7 @@ final class WaveView: NSView {
     var footerDim = false                   // transcribing dims the whole footer
     var footerRight: [(String, String?)] = []   // (label, keycap)
 
-    // Superwhisper geometry: 428x120 card, thin bars on a 3pt pitch.
+    // Card geometry: 428x120, thin bars on a 3pt pitch.
     static let inset: CGFloat = 24
     static let pitch: CGFloat = 3
     static let barW: CGFloat = 1.5
@@ -226,7 +226,7 @@ final class WaveView: NSView {
 
     /// One animation frame. Recording: the wave is a ticker of the last few
     /// seconds - a new bar lands at the right edge every ~80ms and the rest
-    /// slide left, so words read as spindle-shaped blobs like Superwhisper's.
+    /// slide left, so words read as spindle-shaped blobs.
     /// Transcribing: the bars form a soft breathing spindle in the center.
     func tick() {
         switch state {
@@ -263,7 +263,7 @@ final class WaveView: NSView {
         }
     }
 
-    /// Footer row, Superwhisper-style: no band, no divider - just a dim
+    /// Footer row: no band, no divider - just a dim
     /// icon + mode name on the left and labels + keycaps on the right.
     /// The 60fps tick only dirties the wave area, so this text layout runs
     /// just on full redraws (state changes/resize), not every frame.
@@ -363,8 +363,8 @@ final class WaveView: NSView {
                  withAttributes: [.font: capFont, .foregroundColor: NSColor(calibratedWhite: 1, alpha: 0.9)])
     }
 
-    /// The finished transcript, centered on the card, with Superwhisper's
-    /// little expand glyph in the top-right corner.
+    /// The finished transcript, centered on the card, with a little
+    /// expand glyph in the top-right corner.
     private func drawResult() {
         let style = NSMutableParagraphStyle()
         style.alignment = .center
@@ -442,7 +442,7 @@ final class WavePanel: NSPanel {
         wave.footerRight = [("Stop", nil)] + keycaps(hotkey) + [("Cancel", "esc")]
         place()
         wave.needsDisplay = true
-        // Superwhisper-style: the card fades in quickly rather than popping.
+        // The card fades in quickly rather than popping.
         if !isVisible {
             alphaValue = 0
             orderFrontRegardless()
@@ -510,7 +510,7 @@ final class WavePanel: NSPanel {
         timer?.invalidate(); timer = nil
         closeTimer?.invalidate(); closeTimer = nil
         guard isVisible else { return }
-        // Quick whole-card fade, like Superwhisper's exit.
+        // Quick whole-card fade on the way out.
         NSAnimationContext.runAnimationGroup({ ctx in
             ctx.duration = 0.12
             animator().alphaValue = 0
@@ -532,8 +532,8 @@ final class WavePanel: NSPanel {
     }
 
     private func place() {
-        // Preferred spot: wherever it was dragged last, else bottom-center of
-        // the screen with the mouse, like Superwhisper.
+        // Preferred spot: wherever it was dragged last, else bottom-center
+        // of the screen with the mouse.
         var screen: NSScreen?
         var o = NSPoint.zero
         if let saved = UserDefaults.standard.string(forKey: "panelOrigin") {
@@ -741,8 +741,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
             }
         case .recording:
-            // Tap the chord again to stop and paste. Esc asks first,
-            // Superwhisper-style: Return discards, Esc again resumes.
+            // Tap the chord again to stop and paste. Esc asks first:
+            // Return discards, Esc again resumes.
             if type == .keyDown {
                 if event.getIntegerValueField(.keyboardEventAutorepeat) != 0 { return nil }
                 let returnKey: Int64 = 36
@@ -882,8 +882,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             DispatchQueue.main.async {
                 self.history.insert(Transcript(date: Date(), text: text), at: 0)
                 if self.history.count > 10 { self.history.removeLast(self.history.count - 10) }
-                // Superwhisper-style: the card shows what it typed, then fades
-                // away on its own (skipped if Esc already dismissed it).
+                // The card shows what it typed, then fades away on its
+                // own (skipped if Esc already dismissed it).
                 if self.panel.isVisible { self.panel.showResult(text) }
             }
         }
