@@ -1,9 +1,11 @@
 // UltraWhisper - local push-to-talk dictation for macOS.
 //
-// Hold a hotkey, talk, let go. The audio goes ffmpeg -> whisper.cpp -> your
+// Hold a hotkey, talk, let go. The audio goes ffmpeg -> Parakeet TDT v3 via
+// sherpa-onnx (whisper.cpp as fallback) -> your
 // clipboard -> Cmd+V into whatever has focus, then the old clipboard comes
 // back. Everything runs on this Mac; nothing leaves it unless you opt into
-// cleanup mode with an API key in ~/.config/ultrawhisper/.env.
+// cleanup mode in ~/.config/ultrawhisper/.env (local Ollama, or xAI Grok —
+// never OpenAI/Google/Anthropic endpoints).
 //
 // Build: ./build.sh   (see README.md)
 
@@ -27,12 +29,25 @@ struct Config: Codable {
     var sounds: Bool
     var minSeconds: Double       // ignore taps shorter than this
     var cleanupPrompt: String
+    // Optional so an older config.json still decodes; nil means the default.
+    var engine: String?          // "parakeet" (default) or "whisper"
 
     static let dir = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".config/ultrawhisper", isDirectory: true)
     static let file = dir.appendingPathComponent("config.json")
     static let envFile = dir.appendingPathComponent(".env")
     static let modelsDir = dir.appendingPathComponent("models", isDirectory: true)
+
+    var engineName: String { engine ?? "parakeet" }
+
+    // The one place the sherpa-onnx layout is spelled out.
+    static let sherpaRoot = dir.appendingPathComponent("sherpa-onnx").path
+    static let parakeetServerBin = sherpaRoot + "/bin/sherpa-onnx-offline-websocket-server"
+    static let parakeetDir = modelsDir.appendingPathComponent("sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8").path
+    static let parakeetEncoder = parakeetDir + "/encoder.int8.onnx"
+    static let parakeetDecoder = parakeetDir + "/decoder.int8.onnx"
+    static let parakeetJoiner = parakeetDir + "/joiner.int8.onnx"
+    static let parakeetTokens = parakeetDir + "/tokens.txt"
 
     static var defaults: Config {
         Config(
@@ -50,7 +65,8 @@ struct Config: Codable {
             cleanupPrompt: "You clean up voice dictation. Fix punctuation and capitalization, "
                 + "remove filler words (um, uh, like, you know), fix obvious transcription "
                 + "slips, keep the speaker's wording and meaning otherwise. Return only the "
-                + "cleaned text, no commentary, no quotes."
+                + "cleaned text, no commentary, no quotes.",
+            engine: "parakeet"
         )
     }
 
@@ -157,90 +173,229 @@ struct Transcript {
 
 // MARK: - Floating waveform panel (Superwhisper-style)
 
+/// What the card is currently showing.
+enum PanelState { case wave, discard, busy, result }
+
 final class WaveView: NSView {
-    var levels: [CGFloat] = []
-    var maxBars = 0
-    var footerLeft = "UltraWhisper"
+    var state: PanelState = .wave
+    var currentLevel: CGFloat = 0   // latest mic level from the tap
+    private var smoothLevel: CGFloat = 0    // eased mic level; the bars follow this, not the raw tap
+    private var bars: [CGFloat] = []        // scrolled history, oldest first
+    private var ticks = 0
+    private var phase = 0.0                 // transcribing-spindle clock
+    var resultText = ""
+    var footerLeft = "Ultra"
+    var footerDim = false                   // transcribing dims the whole footer
     var footerRight: [(String, String?)] = []   // (label, keycap)
-    var busy = false
+
+    // Superwhisper geometry: 428x120 card, thin bars on a 3pt pitch.
+    static let inset: CGFloat = 24
+    static let pitch: CGFloat = 3
+    static let barW: CGFloat = 1.5
+    static let footerH: CGFloat = 40
+    static let radius: CGFloat = 18
+
+    var waveArea: NSRect {
+        NSRect(x: Self.inset, y: Self.footerH + 4,
+               width: bounds.width - 2 * Self.inset, height: bounds.height - Self.footerH - 18)
+    }
+    private var slots: Int { max(2, Int(waveArea.width / Self.pitch)) }
+
+    private static var iconCache: [String: NSImage] = [:]
+    private func symbol(_ name: String, size: CGFloat = 12) -> NSImage? {
+        let key = "\(name)-\(size)"
+        if let img = Self.iconCache[key] { return img }
+        guard let icon = NSImage(systemSymbolName: name, accessibilityDescription: nil) else { return nil }
+        let cfg = NSImage.SymbolConfiguration(pointSize: size, weight: .semibold)
+        let img = icon.withSymbolConfiguration(cfg) ?? icon
+        img.isTemplate = true
+        Self.iconCache[key] = img
+        return img
+    }
 
     override var isFlipped: Bool { false }
 
+    func reset() {
+        state = .wave
+        bars = []
+        smoothLevel = 0
+        currentLevel = 0
+        ticks = 0
+        phase = 0
+    }
+
+    /// One animation frame. Recording: the wave is a ticker of the last few
+    /// seconds - a new bar lands at the right edge every ~80ms and the rest
+    /// slide left, so words read as spindle-shaped blobs like Superwhisper's.
+    /// Transcribing: the bars form a soft breathing spindle in the center.
+    func tick() {
+        switch state {
+        case .wave:
+            smoothLevel += (currentLevel - smoothLevel) * (currentLevel > smoothLevel ? 0.35 : 0.12)
+            ticks += 1
+            if ticks % 5 == 0 {
+                bars.append(min(1, pow(smoothLevel * 1.35, 0.9)))
+                if bars.count > slots { bars.removeFirst(bars.count - slots) }
+            }
+        case .busy:
+            phase += 1.0 / 30
+        case .discard, .result:
+            return   // static cards, nothing to animate
+        }
+        // Only the bars move frame to frame; leave the card and footer alone.
+        setNeedsDisplay(waveArea.insetBy(dx: 0, dy: -4))
+    }
+
     override func draw(_ rect: NSRect) {
         let b = bounds
-        // Card
-        let card = NSBezierPath(roundedRect: b.insetBy(dx: 0.5, dy: 0.5), xRadius: 18, yRadius: 18)
-        NSColor(calibratedWhite: 0.11, alpha: 0.97).setFill(); card.fill()
-        NSColor(calibratedWhite: 1, alpha: 0.10).setStroke(); card.lineWidth = 1; card.stroke()
+        // Near-opaque dark wash over the blur, plus a hairline border.
+        // (The soft edge translucency comes from the NSVisualEffectView behind us.)
+        let card = NSBezierPath(roundedRect: b.insetBy(dx: 0.5, dy: 0.5), xRadius: Self.radius, yRadius: Self.radius)
+        NSColor(calibratedWhite: 0.07, alpha: 0.55).setFill(); card.fill()
+        NSColor(calibratedWhite: 1, alpha: 0.09).setStroke(); card.lineWidth = 1; card.stroke()
 
-        // Footer strip
-        let footerH: CGFloat = 40
-        let footer = NSRect(x: 10, y: 10, width: b.width - 20, height: footerH)
-        NSColor(calibratedWhite: 0.16, alpha: 1).setFill()
-        NSBezierPath(roundedRect: footer, xRadius: 12, yRadius: 12).fill()
+        drawFooter(rect)
 
-        let font = NSFont.systemFont(ofSize: 15, weight: .medium)
-        let dim = NSColor(calibratedWhite: 1, alpha: 0.55)
-        let bright = NSColor(calibratedWhite: 1, alpha: 0.9)
-
-        // Left: mic glyph + label
-        if let icon = NSImage(systemSymbolName: busy ? "waveform" : "mic.fill", accessibilityDescription: nil) {
-            let cfg = NSImage.SymbolConfiguration(pointSize: 14, weight: .semibold)
-            let img = icon.withSymbolConfiguration(cfg) ?? icon
-            let r = NSRect(x: footer.minX + 16, y: footer.midY - 8, width: 18, height: 16)
-            img.isTemplate = true
-            NSGraphicsContext.current?.cgContext.saveGState()
-            dim.set()
-            img.draw(in: r, from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
-            NSGraphicsContext.current?.cgContext.restoreGState()
+        switch state {
+        case .wave, .busy: drawBars()
+        case .discard: drawDiscard()
+        case .result: drawResult()
         }
-        (footerLeft as NSString).draw(at: NSPoint(x: footer.minX + 46, y: footer.midY - 9),
+    }
+
+    /// Footer row, Superwhisper-style: no band, no divider - just a dim
+    /// icon + mode name on the left and labels + keycaps on the right.
+    /// The 60fps tick only dirties the wave area, so this text layout runs
+    /// just on full redraws (state changes/resize), not every frame.
+    private func drawFooter(_ rect: NSRect) {
+        guard rect.minY < Self.footerH else { return }
+        let footer = NSRect(x: 10, y: 2, width: bounds.width - 20, height: Self.footerH - 4)
+        let font = NSFont.systemFont(ofSize: 13, weight: .medium)
+        let dimA: CGFloat = footerDim ? 0.28 : 0.45
+        let dim = NSColor(calibratedWhite: 1, alpha: dimA)
+        let bright = NSColor(calibratedWhite: 1, alpha: footerDim ? 0.55 : 0.9)
+
+        if let img = symbol("mic.fill", size: 12) {
+            let r = NSRect(x: footer.minX + 14, y: footer.midY - 7, width: 15, height: 14)
+            img.draw(in: r, from: .zero, operation: .sourceOver, fraction: dimA, respectFlipped: true, hints: nil)
+        }
+        (footerLeft as NSString).draw(at: NSPoint(x: footer.minX + 38, y: footer.midY - 8),
                                       withAttributes: [.font: font, .foregroundColor: dim])
 
-        // Right: "Stop [⌥][Space]  Cancel [esc]" laid out right-to-left
-        var x = footer.maxX - 16
+        // Right side, e.g. "Stop [⌘][⌥][Space]  Cancel [esc]", laid out right-to-left.
+        var x = footer.maxX - 14
         for (label, cap) in footerRight.reversed() {
             if let cap = cap {
-                let capFont = NSFont.systemFont(ofSize: 13, weight: .semibold)
-                let w = (cap as NSString).size(withAttributes: [.font: capFont]).width + 16
-                let capRect = NSRect(x: x - w, y: footer.midY - 12, width: w, height: 24)
-                NSColor(calibratedWhite: 0.30, alpha: 1).setFill()
-                NSBezierPath(roundedRect: capRect, xRadius: 6, yRadius: 6).fill()
-                (cap as NSString).draw(at: NSPoint(x: capRect.minX + 8, y: capRect.midY - 8),
+                let capFont = NSFont.systemFont(ofSize: 12, weight: .semibold)
+                let w = (cap as NSString).size(withAttributes: [.font: capFont]).width + 14
+                let capRect = NSRect(x: x - w, y: footer.midY - 10, width: w, height: 20)
+                NSColor(calibratedWhite: 1, alpha: 0.13).setFill()
+                NSBezierPath(roundedRect: capRect, xRadius: 5, yRadius: 5).fill()
+                (cap as NSString).draw(at: NSPoint(x: capRect.minX + 7, y: capRect.midY - 7.5),
                                        withAttributes: [.font: capFont, .foregroundColor: bright])
-                x = capRect.minX - 6
+                x = capRect.minX - 5
             }
             if !label.isEmpty {
                 let w = (label as NSString).size(withAttributes: [.font: font]).width
-                (label as NSString).draw(at: NSPoint(x: x - w, y: footer.midY - 9),
+                (label as NSString).draw(at: NSPoint(x: x - w, y: footer.midY - 8),
                                          withAttributes: [.font: font, .foregroundColor: dim])
-                x -= w + 20
+                x -= w + 18
             }
         }
+    }
 
-        // Waveform: newest sample on the right, scrolls left.
-        let area = NSRect(x: 34, y: footer.maxY + 14, width: b.width - 68, height: b.height - footer.maxY - 28)
-        let pitch: CGFloat = 4, barW: CGFloat = 2
-        maxBars = Int(area.width / pitch)
+    /// Thin bars mirrored around the centerline; quiet bars collapse to dots,
+    /// so silence reads as a dotted line edge to edge.
+    private func drawBars() {
+        let area = waveArea
+        let n = slots
+        var levels = [CGFloat](repeating: 0, count: n)
+        switch state {
+        case .wave:
+            // Right-aligned history plus a live bar hugging the right edge.
+            let recent = bars.suffix(n - 1)
+            let start = n - 1 - recent.count
+            for (i, v) in recent.enumerated() { levels[start + i] = v }
+            levels[n - 1] = min(1, pow(smoothLevel * 1.35, 0.9))
+        case .busy:
+            // Breathing spindle: a soft hump that drifts and swells in place.
+            let c = 0.5 + 0.10 * sin(phase * 1.9)
+            let w = 0.20 + 0.05 * sin(phase * 2.7 + 1)
+            for i in 0..<n {
+                let d = (Double(i) / Double(n - 1) - c) / w
+                levels[i] = CGFloat(0.62 * exp(-d * d))
+            }
+        default: return
+        }
         let mid = area.midY
         let maxH = area.height
-        for i in 0..<maxBars {
-            let idx = levels.count - maxBars + i
-            let lv: CGFloat = idx >= 0 ? levels[idx] : 0
-            let h = max(2, lv * maxH)
-            let alpha: CGFloat = idx >= 0 ? (0.35 + 0.65 * lv) : 0.22
+        let totalW = CGFloat(n) * Self.pitch - (Self.pitch - Self.barW)
+        let x0 = area.midX - totalW / 2
+        for i in 0..<n {
+            let lv = levels[i]
+            let h = max(1.6, lv * maxH)
+            let alpha: CGFloat = h <= 1.6 ? 0.30
+                : state == .busy ? 0.65
+                : 0.40 + 0.60 * min(1, lv * 1.5)
             NSColor(calibratedWhite: 1, alpha: alpha).setFill()
-            let r = NSRect(x: area.minX + CGFloat(i) * pitch, y: mid - h / 2, width: barW, height: h)
-            NSBezierPath(roundedRect: r, xRadius: 1, yRadius: 1).fill()
+            let r = NSRect(x: x0 + CGFloat(i) * Self.pitch, y: mid - h / 2, width: Self.barW, height: h)
+            NSBezierPath(roundedRect: r, xRadius: Self.barW / 2, yRadius: Self.barW / 2).fill()
+        }
+    }
+
+    /// Esc during a take: "Discard recording? [↩]" (Return discards, Esc resumes).
+    private func drawDiscard() {
+        let area = waveArea
+        let font = NSFont.systemFont(ofSize: 15, weight: .medium)
+        let attrs: [NSAttributedString.Key: Any] =
+            [.font: font, .foregroundColor: NSColor(calibratedWhite: 1, alpha: 0.9)]
+        let text = "Discard recording?" as NSString
+        let tw = text.size(withAttributes: attrs).width
+        let capFont = NSFont.systemFont(ofSize: 12, weight: .semibold)
+        let cap = "↩" as NSString
+        let capW = cap.size(withAttributes: [.font: capFont]).width + 14
+        let x = area.midX - (tw + 8 + capW) / 2
+        text.draw(at: NSPoint(x: x, y: area.midY - 9), withAttributes: attrs)
+        let capRect = NSRect(x: x + tw + 8, y: area.midY - 10, width: capW, height: 20)
+        NSColor(calibratedWhite: 1, alpha: 0.13).setFill()
+        NSBezierPath(roundedRect: capRect, xRadius: 5, yRadius: 5).fill()
+        cap.draw(at: NSPoint(x: capRect.minX + 7, y: capRect.midY - 7.5),
+                 withAttributes: [.font: capFont, .foregroundColor: NSColor(calibratedWhite: 1, alpha: 0.9)])
+    }
+
+    /// The finished transcript, centered on the card, with Superwhisper's
+    /// little expand glyph in the top-right corner.
+    private func drawResult() {
+        let style = NSMutableParagraphStyle()
+        style.alignment = .center
+        style.lineBreakMode = .byTruncatingTail
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 13.5),
+            .foregroundColor: NSColor(calibratedWhite: 1, alpha: 0.92),
+            .paragraphStyle: style]
+        let area = waveArea.insetBy(dx: 12, dy: 0)
+        let text = resultText as NSString
+        let bound = text.boundingRect(with: NSSize(width: area.width, height: 38),
+                                      options: [.usesLineFragmentOrigin], attributes: attrs)
+        let h = min(38, bound.height)
+        text.draw(in: NSRect(x: area.minX, y: area.midY - h / 2, width: area.width, height: h),
+                  withAttributes: attrs)
+        for name in ["arrow.down.forward.and.arrow.up.backward", "arrow.up.left.and.arrow.down.right"] {
+            guard let img = symbol(name, size: 9) else { continue }
+            let r = NSRect(x: bounds.maxX - 30, y: bounds.maxY - 28, width: 14, height: 12)
+            img.draw(in: r, from: .zero, operation: .sourceOver, fraction: 0.35, respectFlipped: true, hints: nil)
+            break
         }
     }
 }
 
 final class WavePanel: NSPanel {
     let wave = WaveView()
+    private var timer: Timer?
+    private var closeTimer: Timer?   // auto-fades the result card
 
     init() {
-        super.init(contentRect: NSRect(x: 0, y: 0, width: 520, height: 122),
+        super.init(contentRect: NSRect(x: 0, y: 0, width: 428, height: 120),
                    styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: true)
         isOpaque = false
         backgroundColor = .clear
@@ -249,32 +404,125 @@ final class WavePanel: NSPanel {
         ignoresMouseEvents = false
         isMovableByWindowBackground = true   // grab anywhere on the card and drag
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
-        contentView = wave
+
+        // Frosted-glass card: system blur of whatever is behind the panel,
+        // clipped to the rounded shape. WaveView draws on top of it.
+        let effect = NSVisualEffectView()
+        effect.material = .hudWindow
+        effect.blendingMode = .behindWindow
+        effect.state = .active
+        effect.appearance = NSAppearance(named: .vibrantDark)
+        effect.wantsLayer = true
+        effect.layer?.cornerRadius = WaveView.radius
+        effect.layer?.masksToBounds = true
+        contentView = effect
+        wave.frame = effect.bounds
+        wave.autoresizingMask = [.width, .height]
+        effect.addSubview(wave)
+
+        // If the display layout shifts while the panel is up (wake, monitor
+        // plug/unplug, resolution change), put it back somewhere visible.
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil, queue: .main) { [weak self] _ in
+            guard let self, self.isVisible else { return }
+            self.place()
+        }
+    }
+
+    private func keycaps(_ hotkey: String) -> [(String, String?)] {
+        hotkey.split(separator: "+").map { ("", keycap(String($0))) }
     }
 
     func show(mode: Mode, hotkey: String) {
-        wave.levels = []
-        wave.busy = false
+        closeTimer?.invalidate(); closeTimer = nil
+        wave.reset()
+        wave.footerDim = false
         wave.footerLeft = mode == .cleanup ? "Cleanup" : "Ultra"
-        wave.footerRight = [("Stop", nil)] + hotkey.split(separator: "+").map { ("", keycap(String($0))) } + [("Cancel", "esc")]
+        wave.footerRight = [("Stop", nil)] + keycaps(hotkey) + [("Cancel", "esc")]
         place()
         wave.needsDisplay = true
-        orderFrontRegardless()
+        // Superwhisper-style: the card fades in quickly rather than popping.
+        if !isVisible {
+            alphaValue = 0
+            orderFrontRegardless()
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 0.13
+                animator().alphaValue = 1
+            }
+        } else {
+            alphaValue = 1
+            orderFrontRegardless()
+        }
+        schedule(fps: 60)
+        // Right after a wake the window server can drop the panel somewhere
+        // stale; one more place() after things settle brings it back.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            guard let self, self.isVisible else { return }
+            self.place()
+        }
+    }
+
+    /// Esc during a take: ask before throwing the recording away.
+    func discardPrompt(hotkey: String) {
+        wave.state = .discard
+        wave.footerRight = [("Stop", nil)] + keycaps(hotkey) + [("Continue", "esc")]
+        wave.needsDisplay = true
+    }
+
+    /// Esc again on the prompt: back to the live waveform.
+    func resumeWave(hotkey: String) {
+        wave.state = .wave
+        wave.footerRight = [("Stop", nil)] + keycaps(hotkey) + [("Cancel", "esc")]
+        wave.needsDisplay = true
     }
 
     func transcribing() {
-        wave.busy = true
-        wave.footerLeft = "Transcribing…"
-        wave.footerRight = []
+        wave.state = .busy
+        wave.footerDim = true
+        wave.footerRight = [("Close", "esc")]
         wave.needsDisplay = true
+        schedule(fps: 30)
     }
 
-    func hide() { orderOut(nil) }
+    /// Show the finished transcript on the card for a beat, then fade away.
+    func showResult(_ text: String) {
+        timer?.invalidate(); timer = nil
+        wave.state = .result
+        wave.resultText = text.replacingOccurrences(of: "\n", with: " ")
+        wave.footerDim = false
+        wave.footerRight = [("Close", "esc")]
+        wave.needsDisplay = true
+        closeTimer?.invalidate()
+        let t = Timer(timeInterval: 2.5, repeats: false) { [weak self] _ in self?.hide() }
+        RunLoop.main.add(t, forMode: .common)
+        closeTimer = t
+    }
+
+    private func schedule(fps: Double) {
+        timer?.invalidate()
+        let t = Timer(timeInterval: 1.0 / fps, repeats: true) { [weak self] _ in self?.wave.tick() }
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+    }
+
+    func hide() {
+        timer?.invalidate(); timer = nil
+        closeTimer?.invalidate(); closeTimer = nil
+        guard isVisible else { return }
+        // Quick whole-card fade, like Superwhisper's exit.
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0.12
+            animator().alphaValue = 0
+        }, completionHandler: { [weak self] in
+            guard let self, self.alphaValue == 0 else { return }   // a new show() won the race
+            self.orderOut(nil)
+            self.alphaValue = 1
+        })
+    }
 
     func push(level: CGFloat) {
-        wave.levels.append(level)
-        if wave.levels.count > 400 { wave.levels.removeFirst(wave.levels.count - 400) }
-        wave.needsDisplay = true
+        wave.currentLevel = level
     }
 
     // Wherever you drag it to is where it comes back next time.
@@ -284,17 +532,28 @@ final class WavePanel: NSPanel {
     }
 
     private func place() {
+        // Preferred spot: wherever it was dragged last, else bottom-center of
+        // the screen with the mouse, like Superwhisper.
+        var screen: NSScreen?
+        var o = NSPoint.zero
         if let saved = UserDefaults.standard.string(forKey: "panelOrigin") {
-            let o = NSPointFromString(saved)
-            if NSScreen.screens.contains(where: { $0.visibleFrame.intersects(NSRect(origin: o, size: frame.size)) }) {
-                setFrameOrigin(o); return
-            }
+            o = NSPointFromString(saved)
+            screen = NSScreen.screens.first { $0.visibleFrame.intersects(NSRect(origin: o, size: frame.size)) }
         }
-        // Bottom-center of the screen with the mouse, like Superwhisper.
-        let mouse = NSEvent.mouseLocation
-        let screen = NSScreen.screens.first { $0.frame.contains(mouse) } ?? NSScreen.main ?? NSScreen.screens[0]
-        let f = screen.visibleFrame
-        setFrameOrigin(NSPoint(x: f.midX - frame.width / 2, y: f.minY + 90))
+        if screen == nil {
+            let mouse = NSEvent.mouseLocation
+            let s = NSScreen.screens.first { $0.frame.contains(mouse) } ?? NSScreen.main ?? NSScreen.screens[0]
+            o = NSPoint(x: s.visibleFrame.midX - frame.width / 2, y: s.visibleFrame.minY + 90)
+            screen = s
+        }
+        // Clamp the whole card onto that screen. A stale frame after a
+        // sleep/wake once stranded the panel at x=2606 on a 1440-wide screen:
+        // dictation kept working with no visualizer in sight.
+        if let f = screen?.visibleFrame {
+            o.x = min(max(o.x, f.minX), max(f.minX, f.maxX - frame.width))
+            o.y = min(max(o.y, f.minY), max(f.minY, f.maxY - frame.height))
+        }
+        setFrameOrigin(o)
     }
 
     private func keycap(_ tok: String) -> String {
@@ -318,6 +577,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     var statusItem: NSStatusItem!
     var state: State = .idle { didSet { DispatchQueue.main.async { self.refreshIcon() } } }
+    var discardPrompt = false   // Esc during a take shows "Discard recording?"
     var history: [Transcript] = []
 
     var tap: CFMachPort?
@@ -335,7 +595,9 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let c = Hotkey.parse(cfg.cleanupHotkey) else { fatal("Bad cleanupHotkey in config.json: \(cfg.cleanupHotkey)") }
         recordHK = r; cleanupHK = c
 
+        // Transcripts are private: owner-only dir, and log() keeps files 600.
         try? FileManager.default.createDirectory(at: App.dictationDir, withIntermediateDirectories: true)
+        try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: App.dictationDir.path)
         loadHistory()
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
@@ -358,15 +620,46 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationWillTerminate(_ note: Notification) { server?.terminate() }
 
-    // MARK: Whisper server (model stays loaded between presses)
+    // MARK: Transcription server (model stays loaded in RAM between presses)
 
     var server: Process?
+    var serverIsParakeet = false
     var serverURL: URL { URL(string: "http://127.0.0.1:\(cfg.serverPort)/inference")! }
+    var parakeetWS: URL { URL(string: "ws://127.0.0.1:\(cfg.serverPort)")! }
+
+    func parakeetReady() -> Bool {
+        [Config.parakeetServerBin, Config.parakeetEncoder, Config.parakeetDecoder,
+         Config.parakeetJoiner, Config.parakeetTokens]
+            .allSatisfy { FileManager.default.fileExists(atPath: $0) }
+    }
 
     func startServer() {
         server?.terminate()
         // Kill any orphan from a previous run (a killed app doesn't take its helper with it).
-        _ = run("/usr/bin/pkill", ["-f", "whisper-server.*--port \(cfg.serverPort)"])
+        for pattern in ["whisper-server.*--port \(cfg.serverPort)",
+                        "offline-websocket-server.*--port=\(cfg.serverPort)"] {
+            _ = run("/usr/bin/pkill", ["-f", pattern])
+        }
+
+        // Preferred: Parakeet TDT v3 via sherpa-onnx (fully local, beats
+        // whisper large-v3 on accuracy, ~0.3s per take once warm).
+        if cfg.engineName == "parakeet", parakeetReady() {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: Config.parakeetServerBin)
+            p.arguments = ["--port=\(cfg.serverPort)",
+                           "--encoder=\(Config.parakeetEncoder)", "--decoder=\(Config.parakeetDecoder)",
+                           "--joiner=\(Config.parakeetJoiner)", "--tokens=\(Config.parakeetTokens)",
+                           "--model-type=nemo_transducer", "--num-threads=\(cfg.threads)"]
+            var env = ProcessInfo.processInfo.environment
+            env["DYLD_LIBRARY_PATH"] = Config.sherpaRoot + "/lib"
+            p.environment = env
+            p.standardOutput = FileHandle.nullDevice
+            p.standardError = FileHandle.nullDevice
+            do { try p.run(); server = p; serverIsParakeet = true; return }
+            catch { NSLog("UltraWhisper: parakeet server failed: \(error)") }
+        }
+
+        // Fallback: whisper-server.
         let exe = URL(fileURLWithPath: cfg.whisperPath).deletingLastPathComponent().appendingPathComponent("whisper-server")
         guard FileManager.default.fileExists(atPath: exe.path) else {
             NSLog("UltraWhisper: no whisper-server next to whisper-cli; falling back to whisper-cli per press")
@@ -378,7 +671,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
                        "--host", "127.0.0.1", "--port", String(cfg.serverPort)]
         p.standardOutput = FileHandle.nullDevice
         p.standardError = FileHandle.nullDevice
-        do { try p.run(); server = p } catch { NSLog("UltraWhisper: whisper-server failed: \(error)") }
+        do { try p.run(); server = p; serverIsParakeet = false } catch { NSLog("UltraWhisper: whisper-server failed: \(error)") }
     }
 
     func serverAlive() -> Bool {
@@ -429,6 +722,11 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .idle:
             if type == .keyDown {
                 if event.getIntegerValueField(.keyboardEventAutorepeat) != 0 { return Unmanaged.passUnretained(event) }
+                // Esc closes a lingering result card early.
+                if key == escape, panel.isVisible {
+                    DispatchQueue.main.async { self.panel.hide() }
+                    return nil
+                }
                 for (hk, mode) in chords where hk.keyCode == key && hk.modifiersHeld(flags) {
                     startRecording(mode)
                     return nil   // swallow so the app underneath never sees it
@@ -443,10 +741,21 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
             }
         case .recording:
-            // Tap the chord again to stop and paste; Esc throws the take away.
+            // Tap the chord again to stop and paste. Esc asks first,
+            // Superwhisper-style: Return discards, Esc again resumes.
             if type == .keyDown {
                 if event.getIntegerValueField(.keyboardEventAutorepeat) != 0 { return nil }
-                if key == escape { cancelRecording(); return nil }
+                let returnKey: Int64 = 36
+                if key == escape {
+                    discardPrompt.toggle()
+                    let showing = discardPrompt
+                    DispatchQueue.main.async {
+                        if showing { self.panel.discardPrompt(hotkey: self.cfg.recordHotkey) }
+                        else { self.panel.resumeWave(hotkey: self.cfg.recordHotkey) }
+                    }
+                    return nil
+                }
+                if key == returnKey, discardPrompt { cancelRecording(); return nil }
                 for (hk, _) in chords where hk.keyCode == key && hk.modifiersHeld(flags) {
                     stopRecording(); return nil
                 }
@@ -459,7 +768,13 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
             }
         case .transcribing:
-            break
+            // Esc dismisses the card early; the transcription still finishes
+            // and pastes in the background.
+            if type == .keyDown, key == escape {
+                DispatchQueue.main.async { self.panel.hide() }
+                return nil
+            }
+            if type == .keyUp, key == escape { return nil }
         }
         return Unmanaged.passUnretained(event)
     }
@@ -482,6 +797,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         ffmpeg = p; wavPath = path; recordStart = Date()
+        discardPrompt = false
         state = .recording(mode)
         if cfg.sounds { NSSound(named: "Tink")?.play() }
         DispatchQueue.main.async {
@@ -493,6 +809,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func cancelRecording() {
         guard case .recording = state, let p = ffmpeg, let wav = wavPath else { return }
         ffmpeg = nil; wavPath = nil
+        discardPrompt = false
         state = .idle
         DispatchQueue.main.async { self.stopMeter(); self.panel.hide() }
         work.async {
@@ -530,6 +847,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func stopRecording() {
         guard case .recording(let mode) = state, let p = ffmpeg, let wav = wavPath else { return }
         let elapsed = Date().timeIntervalSince(recordStart ?? Date())
+        discardPrompt = false
         state = .transcribing
         if cfg.sounds { NSSound(named: "Pop")?.play() }
         ffmpeg = nil; wavPath = nil
@@ -539,29 +857,61 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // SIGINT makes ffmpeg finish the wav header cleanly.
             p.interrupt()
             p.waitUntilExit()
-            defer { try? FileManager.default.removeItem(at: wav) }   // audio never sticks around
+            // Whatever happens below, the take never leaves the panel stuck
+            // on the spindle and the audio never sticks around.
+            var pasted = false
+            defer {
+                try? FileManager.default.removeItem(at: wav)
+                self.state = .idle
+                if !pasted { DispatchQueue.main.async { self.panel.hide() } }
+            }
 
-            guard elapsed >= self.cfg.minSeconds else { self.state = .idle; return }
+            guard elapsed >= self.cfg.minSeconds else { return }
             var text = self.transcribe(wav)
-            guard !text.isEmpty else { self.state = .idle; return }
+            guard !text.isEmpty else {
+                // Nothing intelligible; say so out loud instead of hanging.
+                if self.cfg.sounds { DispatchQueue.main.async { NSSound(named: "Basso")?.play() } }
+                return
+            }
 
             if mode == .cleanup, let cleaned = self.cleanup(text) { text = cleaned }
 
             self.paste(text)
             self.log(text)
+            pasted = true
             DispatchQueue.main.async {
                 self.history.insert(Transcript(date: Date(), text: text), at: 0)
                 if self.history.count > 10 { self.history.removeLast(self.history.count - 10) }
+                // Superwhisper-style: the card shows what it typed, then fades
+                // away on its own (skipped if Esc already dismissed it).
+                if self.panel.isVisible { self.panel.showResult(text) }
             }
-            self.state = .idle
-            DispatchQueue.main.async { self.panel.hide() }
         }
     }
 
     // MARK: Transcribe
 
     func transcribe(_ wav: URL) -> String {
-        if serverAlive(), let text = transcribeViaServer(wav) { return clean(text) }
+        // The warm server answers in ~0.3s. Right after launch it may still be
+        // loading the model, so retry briefly before falling back to the CLI.
+        if serverAlive() {
+            // Decode the audio once; only the network part retries.
+            let payload = serverIsParakeet ? parakeetPayload(wav) : nil
+            for wait: TimeInterval in [0, 0.4, 0.8, 1.6, 3.2] {
+                if wait > 0 { Thread.sleep(forTimeInterval: wait) }
+                let text: String?
+                if serverIsParakeet {
+                    guard let payload = payload else { break }
+                    text = transcribeViaParakeet(payload)
+                } else {
+                    text = transcribeViaServer(wav)
+                }
+                if let text = text { return clean(text) }
+                if !serverAlive() { break }
+            }
+        } else {
+            DispatchQueue.main.async { self.startServer() }   // heal it for the next take
+        }
         let (out, _, _) = run(cfg.whisperPath, [
             "-m", cfg.modelPath, "-f", wav.path, "-l", cfg.language,
             "-t", String(cfg.threads), "-nt", "-np",
@@ -574,6 +924,50 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let lines = out.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty && !$0.hasPrefix("[") && !$0.hasPrefix("(") }
         return lines.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// sherpa-onnx offline websocket payload:
+    /// [u32 sample-rate][u32 byte-count][float32 samples in -1..1].
+    func parakeetPayload(_ wav: URL) -> Data? {
+        guard let f = try? AVAudioFile(forReading: wav),
+              let buf = AVAudioPCMBuffer(pcmFormat: f.processingFormat,
+                                         frameCapacity: AVAudioFrameCount(f.length)),
+              (try? f.read(into: buf)) != nil,
+              let ch = buf.floatChannelData?[0], buf.frameLength > 0 else { return nil }
+        let n = Int(buf.frameLength)
+        var payload = Data(capacity: 8 + n * 4)
+        withUnsafeBytes(of: UInt32(f.processingFormat.sampleRate).littleEndian) { payload.append(contentsOf: $0) }
+        withUnsafeBytes(of: UInt32(n * 4).littleEndian) { payload.append(contentsOf: $0) }
+        payload.append(Data(bytes: ch, count: n * 4))
+        return payload
+    }
+
+    /// One binary message in, one JSON message (carrying the transcript) out.
+    func transcribeViaParakeet(_ payload: Data) -> String? {
+        let task = URLSession.shared.webSocketTask(with: parakeetWS)
+        task.resume()
+        let sem = DispatchSemaphore(value: 0)
+        var result: String?
+        task.send(.data(payload)) { err in
+            if err != nil { sem.signal(); return }
+            task.receive { msg in
+                defer { sem.signal() }
+                var raw: String?
+                if case .success(.string(let s)) = msg { raw = s }
+                if case .success(.data(let d)) = msg { raw = String(data: d, encoding: .utf8) }
+                guard let raw = raw else { return }
+                if let data = raw.data(using: .utf8),
+                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let text = json["text"] as? String {
+                    result = text
+                } else {
+                    result = raw
+                }
+            }
+        }
+        if sem.wait(timeout: .now() + 15) == .timedOut { task.cancel(); return nil }
+        task.cancel(with: .normalClosure, reason: nil)
+        return result
     }
 
     func transcribeViaServer(_ wav: URL) -> String? {
@@ -593,7 +987,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         req.httpMethod = "POST"
         req.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
         req.httpBody = body
-        req.timeoutInterval = 60
+        req.timeoutInterval = 15
 
         let sem = DispatchSemaphore(value: 0)
         var result: String?
@@ -608,7 +1002,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return result
     }
 
-    // MARK: Cleanup (optional LLM pass)
+    // MARK: Cleanup (optional LLM pass — local Ollama or xAI Grok ONLY;
+    // this app never talks to OpenAI, Google, or Anthropic endpoints)
 
     func cleanup(_ text: String) -> String? {
         let env = Config.env()
@@ -616,27 +1011,26 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         var body: [String: Any]
         var extract: ([String: Any]) -> String?
 
-        if let key = env["ANTHROPIC_API_KEY"], !key.isEmpty {
-            req = URLRequest(url: URL(string: "https://api.anthropic.com/v1/messages")!)
-            req.addValue(key, forHTTPHeaderField: "x-api-key")
-            req.addValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
-            body = ["model": env["LLM_MODEL"] ?? "claude-haiku-4-5-20251001",
-                    "max_tokens": 2048, "system": cfg.cleanupPrompt,
-                    "messages": [["role": "user", "content": text]]]
+        if let model = env["OLLAMA_MODEL"], !model.isEmpty {
+            // Fully local: talks only to an Ollama server on this Mac.
+            req = URLRequest(url: URL(string: env["OLLAMA_URL"] ?? "http://127.0.0.1:11434/api/chat")!)
+            body = ["model": model, "stream": false,
+                    "messages": [["role": "system", "content": cfg.cleanupPrompt],
+                                 ["role": "user", "content": text]]]
             extract = { json in
-                ((json["content"] as? [[String: Any]])?.first?["text"] as? String)
+                ((json["message"] as? [String: Any])?["content"] as? String)
             }
-        } else if let key = env["OPENAI_API_KEY"], !key.isEmpty {
-            req = URLRequest(url: URL(string: env["OPENAI_BASE_URL"] ?? "https://api.openai.com/v1/chat/completions")!)
+        } else if let key = env["XAI_API_KEY"], !key.isEmpty {
+            req = URLRequest(url: URL(string: "https://api.x.ai/v1/chat/completions")!)
             req.addValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
-            body = ["model": env["LLM_MODEL"] ?? "gpt-4o-mini",
+            body = ["model": env["LLM_MODEL"] ?? "grok-4-fast-non-reasoning",
                     "messages": [["role": "system", "content": cfg.cleanupPrompt],
                                  ["role": "user", "content": text]]]
             extract = { json in
                 (((json["choices"] as? [[String: Any]])?.first?["message"] as? [String: Any])?["content"] as? String)
             }
         } else {
-            return nil   // no key: cleanup mode is just a plain paste
+            return nil   // no provider configured: cleanup mode is just a plain paste
         }
 
         req.httpMethod = "POST"
@@ -655,7 +1049,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if let s = extract(json)?.trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty {
                 result = s
             } else {
-                NSLog("UltraWhisper cleanup: unexpected response \(String(data: data, encoding: .utf8) ?? "")")
+                NSLog("UltraWhisper cleanup: unexpected response shape (body not logged)")
             }
         }.resume()
         sem.wait()
@@ -710,6 +1104,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else {
             try? ("# Dictation \(App.monthFmt.string(from: now))\n\n" + line).write(to: file, atomically: true, encoding: .utf8)
         }
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
     }
 
     func loadHistory() {
@@ -726,30 +1121,24 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: Menu
 
-    /// Menu bar glyph: Superwhisper's rounded triangle outline, pointing down.
+    /// Menu bar glyph: the app-icon five bars (tall, low, mid, low, tall).
+    /// Template image, so the bar tints it.
     static let glyph: NSImage = {
         let size: CGFloat = 22
         let img = NSImage(size: NSSize(width: size, height: size), flipped: false) { _ in
-            let path = NSBezierPath()
-            let cx = size / 2, cy = size / 2 + 0.5
-            let r: CGFloat = 8.6          // distance from center to each corner
-            let corner: CGFloat = 2.8     // corner rounding
-            // triangle pointing down (apex at bottom)
-            let pts = [NSPoint(x: cx - r * 0.95, y: cy + r * 0.5),
-                       NSPoint(x: cx + r * 0.95, y: cy + r * 0.5),
-                       NSPoint(x: cx, y: cy - r)]
-            var mids: [NSPoint] = []
-            for i in 0..<3 {
-                let a = pts[i], b = pts[(i + 1) % 3]
-                mids.append(NSPoint(x: (a.x + b.x) / 2, y: (a.y + b.y) / 2))
+            // App-icon rects (1024 grid, center 512) mapped onto 22pt, y-up.
+            let bars: [(x: CGFloat, y: CGFloat, h: CGFloat)] = [
+                (287, 292, 440), (391, 530, 202), (495, 362, 291),
+                (599, 530, 202), (703, 292, 440)]
+            let s: CGFloat = 0.034
+            NSColor.black.setFill()
+            for b in bars {
+                let w = 34 * s
+                let h = b.h * s
+                let x = 11 + (b.x + 17 - 512) * s - w / 2
+                let yTop = 11 + (512 - b.y) * s        // y-up: icon-grid top edge
+                NSRect(x: x, y: yTop - h, width: w, height: h).fill()
             }
-            path.move(to: mids[2])
-            for i in 0..<3 { path.appendArc(from: pts[i], to: mids[i], radius: corner) }
-            path.close()
-            path.lineWidth = 2.5
-            path.lineJoinStyle = .round
-            NSColor.black.setStroke()
-            path.stroke()
             return true
         }
         img.isTemplate = true
@@ -758,11 +1147,11 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func refreshIcon() {
         guard let b = statusItem.button else { return }
-        let (name, tint, tip): (String, NSColor?, String)
+        let (tint, tip): (NSColor?, String)
         switch state {
-        case .idle: (name, tint, tip) = ("mic", nil, "UltraWhisper: press \(cfg.recordHotkey) to dictate")
-        case .recording: (name, tint, tip) = ("mic.fill", .systemRed, "Recording…")
-        case .transcribing: (name, tint, tip) = ("waveform", .systemOrange, "Transcribing…")
+        case .idle: (tint, tip) = (nil, "UltraWhisper: press \(cfg.recordHotkey) to dictate")
+        case .recording: (tint, tip) = (.systemRed, "Recording…")
+        case .transcribing: (tint, tip) = (.systemOrange, "Transcribing…")
         }
         b.image = App.glyph
         b.contentTintColor = tint
@@ -824,7 +1213,11 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: Model
 
     @discardableResult
+    /// Can the selected engine transcribe? Parakeet needs its sherpa files;
+    /// whisper (selected, or as the fallback) needs a ggml model, which we
+    /// offer to download.
     func checkModel(quiet: Bool) -> Bool {
+        if cfg.engineName == "parakeet" && parakeetReady() { return true }
         if FileManager.default.fileExists(atPath: cfg.modelPath) { return true }
         if !quiet {
             DispatchQueue.main.async {

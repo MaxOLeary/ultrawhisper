@@ -55,6 +55,7 @@ fi
 
 pkill -x UltraWhisper 2>/dev/null || true
 pkill -x whisper-server 2>/dev/null || true
+pkill -f sherpa-onnx-offline-websocket-server 2>/dev/null || true
 rm -rf "/Applications/$APP"
 cp -R "$STAGE/$APP" "/Applications/$APP"
 echo "Installed to /Applications/$APP"

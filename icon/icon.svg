@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <!-- Apple macOS icon-grid shadow: 30% black, y-offset 10, blur 10 at 1024 -->
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="10" stdDeviation="5" flood-color="#000" flood-opacity="0.3"/>
+    </filter>
+    <!-- soft charcoal, faintly lighter at the top -->
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#232326"/>
+      <stop offset="1" stop-color="#0e0e10"/>
+    </linearGradient>
+  </defs>
+
+  <!-- macOS icon grid: 824x824 rounded square centered, 100px margin, r 185.4 -->
+  <rect x="100" y="100" width="824" height="824" rx="185.4" fill="url(#tile)" filter="url(#shadow)"/>
+
+  <!-- Five sharp bars: tall, low, mid, low, tall - levels of a voice -->
+  <g fill="#ffffff">
+    <rect x="287" y="292" width="34" height="440"/>
+    <rect x="391" y="530" width="34" height="202"/>
+    <rect x="495" y="362" width="34" height="291"/>
+    <rect x="599" y="530" width="34" height="202"/>
+    <rect x="703" y="292" width="34" height="440"/>
+  </g>
+</svg>

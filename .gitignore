@@ -3,3 +3,14 @@
 UltraWhisper.app/
 PushTalk.app/
 models/
+
+# Local icon scratch — old drafts and reference files, not part of the app.
+icon/superwhisper-original.icns
+icon/UltraWhisper-old.icns
+icon/flipped-256.png
+icon/menubar@2x.png
+icon/mkmenubar.swift
+icon/preview-menubar.png
+icon/menubar-white*
+icon/UltraWhisper.iconset/
+log.txt
