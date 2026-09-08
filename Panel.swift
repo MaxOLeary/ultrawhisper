@@ -76,6 +76,9 @@ final class WaveView: NSView {
 
     override func draw(_ rect: NSRect) {
         let b = bounds
+        // Clip to the pill so tall bars can't paint through the 32px corners
+        // and show up as a halo outside the card.
+        NSBezierPath(roundedRect: b, xRadius: Self.radius, yRadius: Self.radius).addClip()
         // Near-opaque dark wash over the blur, plus a hairline border.
         // (The soft edge translucency comes from the NSVisualEffectView behind us.)
         let card = NSBezierPath(roundedRect: b.insetBy(dx: 0.5, dy: 0.5), xRadius: Self.radius, yRadius: Self.radius)
@@ -217,6 +220,9 @@ final class WavePanel: NSPanel {
         effect.layer?.cornerRadius = WaveView.radius
         effect.layer?.masksToBounds = true
         contentView = effect
+        wave.wantsLayer = true
+        wave.layer?.cornerRadius = WaveView.radius
+        wave.layer?.masksToBounds = true
         wave.frame = effect.bounds
         wave.autoresizingMask = [.width, .height]
         effect.addSubview(wave)
