@@ -325,15 +325,25 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationWillTerminate(_ note: Notification) {
         _ = capture.stop()
+        proxy?.stop()
         server?.terminate()
     }
 
     // MARK: Transcription server (model stays loaded in RAM between presses)
 
     var server: Process?
+    var proxy: LoopbackProxy?
     var serverIsParakeet = false
     var serverURL: URL { URL(string: "http://127.0.0.1:\(cfg.serverPort)/inference")! }
     var parakeetWS: URL { URL(string: "ws://127.0.0.1:\(cfg.serverPort)")! }
+
+    // sherpa-onnx binds 0.0.0.0 (no --host). sandbox-exec denies LAN inbound.
+    static let sherpaSandbox = """
+    (version 1)
+    (allow default)
+    (deny network-inbound)
+    (allow network-inbound (local ip "localhost:*"))
+    """
 
     /// The Parakeet files to run, or nil when the engine isn't installed.
     func parakeetReady() -> Config.ParakeetFiles? {
@@ -341,10 +351,13 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func startServer() {
-        server?.terminate()
+        proxy?.stop(); proxy = nil
+        server?.terminate(); server = nil
         // Kill any orphan from a previous run (a killed app doesn't take its helper with it).
+        let childPort = cfg.serverPort + 1
         for pattern in ["whisper-server.*--port \(cfg.serverPort)",
-                        "offline-websocket-server.*--port=\(cfg.serverPort)"] {
+                        "offline-websocket-server.*--port=\(cfg.serverPort)",
+                        "offline-websocket-server.*--port=\(childPort)"] {
             _ = run("/usr/bin/pkill", ["-f", pattern])
         }
 
@@ -352,12 +365,20 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // whisper large-v3 on accuracy, well under a second per take once warm).
         if cfg.engineName == "parakeet", let pk = parakeetReady() {
             NSLog("UltraWhisper: starting Parakeet server with \(pk.name)")
+            guard let proxy = LoopbackProxy(port: UInt16(cfg.serverPort), destPort: UInt16(childPort)) else {
+                NSLog("UltraWhisper: loopback proxy failed on \(cfg.serverPort)")
+                return
+            }
+            self.proxy = proxy
+            let log = FileManager.default.temporaryDirectory.appendingPathComponent("ultrawhisper-sherpa.log").path
             let p = Process()
-            p.executableURL = URL(fileURLWithPath: Config.parakeetServerBin)
-            p.arguments = ["--port=\(cfg.serverPort)",
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/sandbox-exec")
+            p.arguments = ["-p", App.sherpaSandbox, Config.parakeetServerBin,
+                           "--port=\(childPort)",
                            "--encoder=\(pk.encoder)", "--decoder=\(pk.decoder)",
                            "--joiner=\(pk.joiner)", "--tokens=\(pk.tokens)",
-                           "--model-type=nemo_transducer", "--num-threads=\(cfg.threads)"]
+                           "--model-type=nemo_transducer", "--num-threads=\(cfg.threads)",
+                           "--log-file=\(log)"]
                 + cfg.hotwordArgs(for: pk)
             var env = ProcessInfo.processInfo.environment
             env["DYLD_LIBRARY_PATH"] = Config.sherpaRoot + "/lib"
@@ -365,7 +386,10 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             p.standardOutput = FileHandle.nullDevice
             p.standardError = FileHandle.nullDevice
             do { try p.run(); server = p; serverIsParakeet = true; return }
-            catch { NSLog("UltraWhisper: parakeet server failed: \(error)") }
+            catch {
+                NSLog("UltraWhisper: parakeet server failed: \(error)")
+                proxy.stop(); self.proxy = nil
+            }
         }
 
         // Fallback: whisper-server.

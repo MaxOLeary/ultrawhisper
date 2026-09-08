@@ -9,7 +9,7 @@ BIN="$APP/Contents/MacOS/UltraWhisper"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"
 
-SRCS=(main.swift Capture.swift Panel.swift)
+SRCS=(main.swift Capture.swift Panel.swift Proxy.swift)
 swiftc -O -target arm64-apple-macos12.0  "${SRCS[@]}" -o "$BIN-arm64"
 swiftc -O -target x86_64-apple-macos12.0 "${SRCS[@]}" -o "$BIN-x86_64"
 lipo -create -output "$BIN" "$BIN-arm64" "$BIN-x86_64"
