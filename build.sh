@@ -1,19 +1,17 @@
 #!/bin/bash
-# Compiles main.swift into UltraWhisper.app, signs it, installs to /Applications.
+# Compiles UltraWhisper via SwiftPM, signs it, installs to /Applications.
 set -e
 cd "$(dirname "$0")"
 
 APP="UltraWhisper.app"
 BIN="$APP/Contents/MacOS/UltraWhisper"
 
+swift build -c release --product UltraWhisper --arch arm64
+REL="$(swift build -c release --arch arm64 --show-bin-path)"
+
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"
-
-SRCS=(main.swift Capture.swift Panel.swift Proxy.swift)
-swiftc -O -target arm64-apple-macos12.0  "${SRCS[@]}" -o "$BIN-arm64"
-swiftc -O -target x86_64-apple-macos12.0 "${SRCS[@]}" -o "$BIN-x86_64"
-lipo -create -output "$BIN" "$BIN-arm64" "$BIN-x86_64"
-rm "$BIN-arm64" "$BIN-x86_64"
+cp "$REL/UltraWhisper" "$BIN"
 
 mkdir -p "$APP/Contents/Resources"
 cp icon/UltraWhisper.icns "$APP/Contents/Resources/"
@@ -30,7 +28,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundleShortVersionString</key><string>1.0</string>
     <key>CFBundlePackageType</key>     <string>APPL</string>
     <key>CFBundleExecutable</key>      <string>UltraWhisper</string>
-    <key>LSMinimumSystemVersion</key>  <string>12.0</string>
+    <key>LSMinimumSystemVersion</key>  <string>14.0</string>
     <key>NSHighResolutionCapable</key> <true/>
     <key>LSUIElement</key>             <true/>
     <key>CFBundleIconFile</key>         <string>UltraWhisper</string>

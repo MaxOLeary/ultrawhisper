@@ -209,16 +209,16 @@ final class WavePanel: NSPanel {
         isMovableByWindowBackground = true   // grab anywhere on the card and drag
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
 
-        // Frosted-glass card: system blur of whatever is behind the panel,
-        // clipped to the rounded shape. WaveView draws on top of it.
+        // Frosted-glass card. layer.cornerRadius does not clip the material, so
+        // the blur would fill the window's square and show as a halo outside the
+        // pill. maskImage on the contentView clips the blur and shapes the
+        // window shadow to the same rounded rect.
         let effect = NSVisualEffectView()
         effect.material = .hudWindow
         effect.blendingMode = .behindWindow
         effect.state = .active
         effect.appearance = NSAppearance(named: .vibrantDark)
-        effect.wantsLayer = true
-        effect.layer?.cornerRadius = WaveView.radius
-        effect.layer?.masksToBounds = true
+        effect.maskImage = Self.roundedMask(radius: WaveView.radius)
         contentView = effect
         wave.wantsLayer = true
         wave.layer?.cornerRadius = WaveView.radius
@@ -252,6 +252,7 @@ final class WavePanel: NSPanel {
         if !isVisible {
             alphaValue = 0
             orderFrontRegardless()
+            invalidateShadow()
             NSAnimationContext.runAnimationGroup { ctx in
                 ctx.duration = 0.13
                 animator().alphaValue = 1
@@ -259,6 +260,7 @@ final class WavePanel: NSPanel {
         } else {
             alphaValue = 1
             orderFrontRegardless()
+            invalidateShadow()
         }
         schedule(fps: 60)
         // Right after a wake the window server can drop the panel somewhere
@@ -345,6 +347,19 @@ final class WavePanel: NSPanel {
             o.y = min(max(o.y, f.minY), max(f.minY, f.maxY - frame.height))
         }
         setFrameOrigin(o)
+    }
+
+    /// Stretchable rounded-rect mask. capInsets of `radius` keep the corners
+    /// unscaled so the pill stays circular at any size.
+    private static func roundedMask(radius: CGFloat) -> NSImage {
+        let img = NSImage(size: NSSize(width: radius * 2, height: radius * 2), flipped: false) { rect in
+            NSColor.black.set()
+            NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius).fill()
+            return true
+        }
+        img.capInsets = NSEdgeInsets(top: radius, left: radius, bottom: radius, right: radius)
+        img.resizingMode = .stretch
+        return img
     }
 
     private func keycap(_ tok: String) -> String {

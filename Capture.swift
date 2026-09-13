@@ -6,16 +6,20 @@ final class Capture {
     static let sampleRate: Double = 16_000
 
     var onLevel: ((CGFloat) -> Void)?
+    /// New 16 kHz samples, called off the audio thread's tap. Copy is already ours.
+    var onChunk: (([Float]) -> Void)?
 
     private var engine: AVAudioEngine?
     private var converter: AVAudioConverter?
     private var samples: [Float] = []
     private let lock = NSLock()
+    private var live = false
 
     func start() -> Bool {
         lock.lock()
         samples.removeAll(keepingCapacity: true)
         samples.reserveCapacity(Int(Capture.sampleRate * 30))
+        live = true
         lock.unlock()
 
         let e = AVAudioEngine()
@@ -52,9 +56,12 @@ final class Capture {
             if err != nil { return }
             guard let dstCh = out.floatChannelData?[0], out.frameLength > 0 else { return }
             let n = Int(out.frameLength)
+            let chunk = Array(UnsafeBufferPointer(start: dstCh, count: n))
             self.lock.lock()
-            self.samples.append(contentsOf: UnsafeBufferPointer(start: dstCh, count: n))
+            self.samples.append(contentsOf: chunk)
+            let running = self.live
             self.lock.unlock()
+            if running { self.onChunk?(chunk) }
         }
         do { try e.start(); engine = e; return true } catch {
             NSLog("UltraWhisper capture: \(error)")
@@ -66,10 +73,14 @@ final class Capture {
 
     @discardableResult
     func stop() -> [Float] {
+        lock.lock()
+        live = false
+        lock.unlock()
         engine?.inputNode.removeTap(onBus: 0)
         engine?.stop()
         engine = nil
         converter = nil
+        onChunk = nil
         lock.lock()
         let s = samples
         samples.removeAll(keepingCapacity: true)

@@ -1,0 +1,35 @@
+OpenFOAM
+VortexCFD
+Vortex CFD
+ParaView
+AirShaper
+CfdOF
+snappyHexMesh
+blockMesh
+Postit
+UltraWhisper
+Superwhisper
+Ghostty
+tmux
+Neovim
+rmpc
+MPD
+Soulseek
+Obsidian
+Electron
+Figma
+Spotify
+Safari
+Claude
+Claude Code
+Opus
+Sonnet
+Parakeet
+sherpa-onnx
+markdown
+LaunchAgent
+Xcode
+SwiftUI
+kerning
+STL
+CAD

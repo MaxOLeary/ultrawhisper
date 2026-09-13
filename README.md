@@ -28,14 +28,14 @@ Change the keys in `~/.config/ultrawhisper/config.json`, then pick
 Needs the Xcode command line tools (`swiftc`). No Homebrew.
 
 ```sh
-./download-model.sh               # Parakeet v3 int8 (~640 MB) + sherpa-onnx
 ./build.sh                        # installs /Applications/UltraWhisper.app
-open -a UltraWhisper
+open -a UltraWhisper              # first launch downloads Parakeet CoreML
 ```
 
-Transcription is NVIDIA Parakeet TDT (v3 int8) running locally. Audio stays in
-RAM and is never written to disk. If Parakeet is missing, the app can fall
-back to whisper.cpp (`brew install whisper-cpp` and `./download-model.sh base.en`).
+Transcription is NVIDIA Parakeet TDT v3 running locally through FluidAudio on
+the Apple Neural Engine. Audio stays in RAM and is never written to disk. If
+Parakeet is not ready, the app can fall back to whisper.cpp
+(`brew install whisper-cpp` and `./download-model.sh base.en`).
 
 ## First run
 
@@ -54,10 +54,9 @@ terminal instead.
 | Vocabulary | `~/.config/ultrawhisper/vocabulary.txt` - words Parakeet should favor (off by default) |
 | Replacements | `~/.config/ultrawhisper/replacements.txt` - `heard -> wanted`, whole words |
 
-Vocabulary and replacements take effect after **Reload Config**. Vocabulary is
-off until you set `"hotwordsScore": 1` in config.json (on real takes it made
-accuracy slightly worse). Replacements are plain find-and-replace, case-insensitive
-on the left, exact on the right, so `vortex cfd -> VortexCFD` does not need an LLM.
+Replacements take effect after **Reload Config**. They are plain find-and-replace,
+case-insensitive on the left, exact on the right, so `vortex cfd -> VortexCFD`
+does not need an LLM. `vocabulary.txt` is unused for now.
 
 The menu bar icon keeps your last 10 takes - click one to copy it.
 

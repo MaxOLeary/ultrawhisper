@@ -3,6 +3,9 @@
 UltraWhisper.app/
 PushTalk.app/
 models/
+.build/
+.swiftpm/
+log.txt
 
 # Local icon scratch — old drafts and reference files, not part of the app.
 icon/superwhisper-original.icns
@@ -13,4 +16,7 @@ icon/mkmenubar.swift
 icon/preview-menubar.png
 icon/menubar-white*
 icon/UltraWhisper.iconset/
-log.txt
+
+# Eval junk
+eval/__pycache__/
+eval/*.log

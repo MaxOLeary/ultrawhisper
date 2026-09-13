@@ -1,8 +1,9 @@
 // UltraWhisper - local push-to-talk dictation for macOS.
 //
-// Hold a hotkey, talk, let go. Mic PCM (AVAudioEngine, 16 kHz in RAM) goes
-// to Parakeet TDT via sherpa-onnx (whisper.cpp as fallback) -> clipboard
-// -> Cmd+V into whatever has focus, then the old clipboard comes back.
+// Tap the hotkey, talk, tap again. Mic PCM (AVAudioEngine, 16 kHz in RAM) is
+// segmented on pauses and decoded while you speak (FluidAudio Parakeet TDT
+// on the Neural Engine), then pasted via clipboard -> Cmd+V into whatever
+// has focus, then the old clipboard comes back.
 // Everything runs on this Mac; nothing leaves it unless you opt into
 // cleanup mode in ~/.config/ultrawhisper/.env (local Ollama, or xAI Grok —
 // never OpenAI/Google/Anthropic endpoints).
@@ -43,58 +44,6 @@ struct Config: Codable {
 
     var engineName: String { engine ?? "parakeet" }
 
-    // The one place the sherpa-onnx layout is spelled out.
-    static let sherpaRoot = dir.appendingPathComponent("sherpa-onnx").path
-    static let parakeetServerBin = sherpaRoot + "/bin/sherpa-onnx-offline-websocket-server"
-
-    /// The build download-model.sh installs: small enough for an 8 GB Mac.
-    /// The v2 fp16 build (~1.1 GB) hears takes int8 drops but costs more RAM
-    /// and is only partly measured (eval/); set parakeetModel to use it.
-    static let defaultParakeet = "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8"
-
-    struct ParakeetFiles {
-        let dir, encoder, decoder, joiner, tokens: String
-        var name: String { URL(fileURLWithPath: dir).lastPathComponent }
-    }
-
-    /// The model folder to use and its files. Each build names its weights
-    /// differently (encoder.fp16.onnx / encoder.int8.onnx / encoder.onnx),
-    /// so look for whichever is there. nil = nothing usable installed.
-    func parakeetFiles() -> ParakeetFiles? {
-        let fm = FileManager.default
-        let dir = Config.modelsDir.appendingPathComponent(parakeetModel ?? Config.defaultParakeet).path
-        func find(_ stem: String) -> String? {
-            [".int8.onnx", ".fp16.onnx", ".onnx"].map { "\(dir)/\(stem)\($0)" }.first(where: fm.fileExists)
-        }
-        let tokens = dir + "/tokens.txt"
-        guard let e = find("encoder"), let d = find("decoder"), let j = find("joiner"),
-              fm.fileExists(atPath: tokens) else { return nil }
-        return ParakeetFiles(dir: dir, encoder: e, decoder: d, joiner: j, tokens: tokens)
-    }
-
-    /// Extra sherpa flags that make Parakeet favor the words in
-    /// vocabulary.txt. Empty (plain greedy decoding) unless hotwordsScore is
-    /// set in config.json, because on real takes it scored worse (README).
-    /// Hotwords need beam search plus a sentencepiece vocab; the model ships
-    /// without one, so we fabricate it from tokens.txt (equal scores =
-    /// longest-match spelling).
-    func hotwordArgs(for pk: ParakeetFiles) -> [String] {
-        guard let score = hotwordsScore else { return [] }
-        let words = Config.lines(of: Config.vocabularyFile)
-        guard !words.isEmpty else { return [] }
-        try? (words.joined(separator: "\n") + "\n").write(to: Config.hotwordsFile, atomically: true, encoding: .utf8)
-
-        let vocab = pk.dir + "/bpe.vocab"
-        if !FileManager.default.fileExists(atPath: vocab),
-           let tokens = try? String(contentsOf: URL(fileURLWithPath: pk.tokens), encoding: .utf8) {
-            let pieces = tokens.split(separator: "\n").compactMap { $0.split(separator: " ").first }
-                .filter { !$0.hasPrefix("<") }
-            try? pieces.map { "\($0)\t-1" }.joined(separator: "\n").write(toFile: vocab, atomically: true, encoding: .utf8)
-        }
-        return ["--decoding-method=modified_beam_search", "--hotwords-file=\(Config.hotwordsFile.path)",
-                "--modeling-unit=bpe", "--bpe-vocab=\(vocab)", "--hotwords-score=\(score)"]
-    }
-
     static var defaults: Config {
         Config(
             modelPath: modelsDir.appendingPathComponent("ggml-base.en.bin").path,
@@ -104,7 +53,7 @@ struct Config: Codable {
             threads: 4,
             serverPort: 8765,
             language: "en",
-            recordHotkey: "cmd+alt+space",
+            recordHotkey: "alt+space",
             cleanupHotkey: "cmd+alt+shift+space",
             sounds: true,
             minSeconds: 0.35,
@@ -150,7 +99,7 @@ struct Config: Codable {
         let templates = [
             (vocabularyFile, """
             # Words Parakeet should lean toward when unsure. One per line.
-            # Only used when config.json has "hotwordsScore" (try 1); see README.
+            # Unused until FluidAudio vocabulary boosting is wired. See README.
             UltraWhisper
 
             """),
@@ -272,6 +221,15 @@ struct Transcript {
     let text: String
 }
 
+/// One Option+Space take. `gen` lets Esc discard drop in-flight segment jobs.
+final class StreamTake {
+    let gen: Int
+    var texts: [String] = []
+    var decodeMs: Double = 0
+    var unhealthy = false
+    init(gen: Int) { self.gen = gen }
+}
+
 
 // MARK: - App
 
@@ -289,7 +247,10 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var tap: CFMachPort?
     let panel = WavePanel()
     let capture = Capture()
+    let segmenter = Segmenter()
     let work = DispatchQueue(label: "ultrawhisper.work")
+    var takeGen = 0
+    var take: StreamTake?
 
     static let dictationDir = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Dictation", isDirectory: true)
@@ -320,79 +281,33 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else {
             installTap()
         }
-        if checkModel(quiet: true) { startServer() }
+        if checkModel(quiet: true) { startEngine() }
     }
 
     func applicationWillTerminate(_ note: Notification) {
+        takeGen += 1
+        take = nil
         _ = capture.stop()
-        proxy?.stop()
         server?.terminate()
     }
 
-    // MARK: Transcription server (model stays loaded in RAM between presses)
+    // MARK: Engine (FluidAudio in-process; whisper-server only if engine is whisper)
 
+    let parakeet = ParakeetEngine()
     var server: Process?
-    var proxy: LoopbackProxy?
-    var serverIsParakeet = false
     var serverURL: URL { URL(string: "http://127.0.0.1:\(cfg.serverPort)/inference")! }
-    var parakeetWS: URL { URL(string: "ws://127.0.0.1:\(cfg.serverPort)")! }
 
-    // sherpa-onnx binds 0.0.0.0 (no --host). sandbox-exec denies LAN inbound.
-    static let sherpaSandbox = """
-    (version 1)
-    (allow default)
-    (deny network-inbound)
-    (allow network-inbound (local ip "localhost:*"))
-    """
-
-    /// The Parakeet files to run, or nil when the engine isn't installed.
-    func parakeetReady() -> Config.ParakeetFiles? {
-        FileManager.default.fileExists(atPath: Config.parakeetServerBin) ? cfg.parakeetFiles() : nil
+    func startEngine() {
+        server?.terminate(); server = nil
+        _ = run("/usr/bin/pkill", ["-f", "whisper-server.*--port \(cfg.serverPort)"])
+        if cfg.engineName == "parakeet" {
+            parakeet.start()
+            return
+        }
+        startWhisperServer()
     }
 
-    func startServer() {
-        proxy?.stop(); proxy = nil
-        server?.terminate(); server = nil
-        // Kill any orphan from a previous run (a killed app doesn't take its helper with it).
-        let childPort = cfg.serverPort + 1
-        for pattern in ["whisper-server.*--port \(cfg.serverPort)",
-                        "offline-websocket-server.*--port=\(cfg.serverPort)",
-                        "offline-websocket-server.*--port=\(childPort)"] {
-            _ = run("/usr/bin/pkill", ["-f", pattern])
-        }
-
-        // Preferred: Parakeet TDT via sherpa-onnx (fully local, beats
-        // whisper large-v3 on accuracy, well under a second per take once warm).
-        if cfg.engineName == "parakeet", let pk = parakeetReady() {
-            NSLog("UltraWhisper: starting Parakeet server with \(pk.name)")
-            guard let proxy = LoopbackProxy(port: UInt16(cfg.serverPort), destPort: UInt16(childPort)) else {
-                NSLog("UltraWhisper: loopback proxy failed on \(cfg.serverPort)")
-                return
-            }
-            self.proxy = proxy
-            let log = FileManager.default.temporaryDirectory.appendingPathComponent("ultrawhisper-sherpa.log").path
-            let p = Process()
-            p.executableURL = URL(fileURLWithPath: "/usr/bin/sandbox-exec")
-            p.arguments = ["-p", App.sherpaSandbox, Config.parakeetServerBin,
-                           "--port=\(childPort)",
-                           "--encoder=\(pk.encoder)", "--decoder=\(pk.decoder)",
-                           "--joiner=\(pk.joiner)", "--tokens=\(pk.tokens)",
-                           "--model-type=nemo_transducer", "--num-threads=\(cfg.threads)",
-                           "--log-file=\(log)"]
-                + cfg.hotwordArgs(for: pk)
-            var env = ProcessInfo.processInfo.environment
-            env["DYLD_LIBRARY_PATH"] = Config.sherpaRoot + "/lib"
-            p.environment = env
-            p.standardOutput = FileHandle.nullDevice
-            p.standardError = FileHandle.nullDevice
-            do { try p.run(); server = p; serverIsParakeet = true; return }
-            catch {
-                NSLog("UltraWhisper: parakeet server failed: \(error)")
-                proxy.stop(); self.proxy = nil
-            }
-        }
-
-        // Fallback: whisper-server.
+    func startWhisperServer() {
         let exe = URL(fileURLWithPath: cfg.whisperPath).deletingLastPathComponent().appendingPathComponent("whisper-server")
         guard FileManager.default.fileExists(atPath: exe.path) else {
             NSLog("UltraWhisper: no whisper-server next to whisper-cli; falling back to whisper-cli per press")
@@ -404,7 +319,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
                        "--host", "127.0.0.1", "--port", String(cfg.serverPort)]
         p.standardOutput = FileHandle.nullDevice
         p.standardError = FileHandle.nullDevice
-        do { try p.run(); server = p; serverIsParakeet = false } catch { NSLog("UltraWhisper: whisper-server failed: \(error)") }
+        do { try p.run(); server = p } catch { NSLog("UltraWhisper: whisper-server failed: \(error)") }
     }
 
     func serverAlive() -> Bool {
@@ -516,7 +431,16 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func startRecording(_ mode: Mode) {
         guard checkModel(quiet: false) else { return }
+        takeGen += 1
+        let gen = takeGen
+        take = StreamTake(gen: gen)
+        segmenter.reset()
+        capture.onChunk = { [weak self] chunk in
+            self?.work.async { self?.ingest(chunk, gen: gen) }
+        }
         guard capture.start() else {
+            take = nil
+            capture.onChunk = nil
             alert("Couldn't open the microphone.")
             return
         }
@@ -531,8 +455,11 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func cancelRecording() {
         guard case .recording = state else { return }
         discardPrompt = false
+        takeGen += 1
+        take = nil
         state = .idle
         _ = capture.stop()
+        work.async { self.segmenter.reset() }
         DispatchQueue.main.async { self.panel.hide() }
     }
 
@@ -542,64 +469,132 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         state = .transcribing
         if cfg.sounds { NSSound(named: "Pop")?.play() }
         let samples = capture.stop()
+        let gen = take?.gen ?? takeGen
+        let tStop = CFAbsoluteTimeGetCurrent()
         DispatchQueue.main.async { self.panel.transcribing() }
 
-        work.async {
-            let t0 = CFAbsoluteTimeGetCurrent()
-            var pasted = false
-            defer {
-                self.state = .idle
-                if !pasted { DispatchQueue.main.async { self.panel.hide() } }
-            }
+        work.async { self.finishTake(samples: samples, mode: mode, gen: gen, tStop: tStop) }
+    }
 
-            let seconds = Double(samples.count) / Capture.sampleRate
-            guard seconds >= self.cfg.minSeconds else { return }
-            var text = self.transcribe(samples)
-            let tAsr = CFAbsoluteTimeGetCurrent()
-            guard !text.isEmpty else {
-                if self.cfg.sounds { DispatchQueue.main.async { NSSound(named: "Basso")?.play() } }
-                NSLog("UltraWhisper: %.1fs audio, asr=%.0fms empty", seconds, (tAsr - t0) * 1000)
-                return
-            }
-
-            if mode == .cleanup, let cleaned = self.cleanup(text) { text = cleaned }
-            text = Config.applyReplacements(self.replacements, to: text)
-
-            pasted = true
-            DispatchQueue.main.async {
-                self.history.insert(Transcript(date: Date(), text: text), at: 0)
-                if self.history.count > 10 { self.history.removeLast(self.history.count - 10) }
-                self.panel.hide()
-            }
-            self.paste(text)
-            self.log(text)
-            NSLog("UltraWhisper: %.1fs audio, asr=%.0fms paste=%.0fms",
-                  seconds, (tAsr - t0) * 1000, (CFAbsoluteTimeGetCurrent() - tAsr) * 1000)
+    func ingest(_ samples: [Float], gen: Int) {
+        guard take?.gen == gen else { return }
+        for chunk in segmenter.push(samples) {
+            decodeSegment(chunk, gen: gen)
         }
+    }
+
+    func decodeSegment(_ chunk: Segmenter.Chunk, gen: Int) {
+        guard chunk.voiced, take?.gen == gen else { return }
+        let t0 = CFAbsoluteTimeGetCurrent()
+        let text = transcribe(chunk.samples, waitForServer: false)
+        let dt = (CFAbsoluteTimeGetCurrent() - t0) * 1000
+        guard let take, take.gen == gen else { return }
+        take.decodeMs += dt
+        let secs = Double(chunk.samples.count) / Capture.sampleRate
+        if text.isEmpty {
+            take.unhealthy = true
+            NSLog("UltraWhisper: segment %.1fs empty in %.0fms — will fall back", secs, dt)
+        } else {
+            take.texts.append(text)
+            NSLog("UltraWhisper: segment %.1fs in %.0fms", secs, dt)
+        }
+    }
+
+    func finishTake(samples: [Float], mode: Mode, gen: Int, tStop: CFAbsoluteTime) {
+        var pasted = false
+        defer {
+            self.take = nil
+            self.state = .idle
+            if !pasted { DispatchQueue.main.async { self.panel.hide() } }
+        }
+        guard take?.gen == gen else { return }
+
+        let overlapped = take?.decodeMs ?? 0
+        let liveOk = take?.unhealthy == false && !(take?.texts.isEmpty ?? true)
+        let seconds = Double(samples.count) / Capture.sampleRate
+        guard seconds >= cfg.minSeconds else { return }
+
+        var fallback = false
+        var text: String
+        if liveOk {
+            // Pauses already decoded while talking. Only run the tail.
+            if samples.count > segmenter.consumed {
+                for chunk in segmenter.push(Array(samples[segmenter.consumed...])) {
+                    decodeSegment(chunk, gen: gen)
+                }
+            }
+            if let tail = segmenter.finalize() {
+                decodeSegment(tail, gen: gen)
+            }
+            guard take?.gen == gen else { return }
+            if let take, !take.unhealthy, !take.texts.isEmpty {
+                text = take.texts.joined(separator: " ")
+            } else {
+                fallback = true
+                text = transcribe(samples, waitForServer: true)
+            }
+        } else {
+            // No live segments (two words, or no ~2s pause): one Parakeet call,
+            // same as before stage 1. Do not decode the tail and then the
+            // whole buffer.
+            segmenter.reset()
+            fallback = take?.unhealthy == true
+            text = transcribe(samples, waitForServer: true)
+        }
+
+        let tAsr = CFAbsoluteTimeGetCurrent()
+        guard !text.isEmpty else {
+            if cfg.sounds { DispatchQueue.main.async { NSSound(named: "Basso")?.play() } }
+            NSLog("UltraWhisper: %.1fs audio, overlapped=%.0fms asr=%.0fms empty fallback=%d",
+                  seconds, overlapped, (tAsr - tStop) * 1000, fallback ? 1 : 0)
+            return
+        }
+
+        if mode == .cleanup, let cleaned = cleanup(text) { text = cleaned }
+        text = Config.applyReplacements(replacements, to: text)
+
+        pasted = true
+        DispatchQueue.main.async {
+            self.history.insert(Transcript(date: Date(), text: text), at: 0)
+            if self.history.count > 10 { self.history.removeLast(self.history.count - 10) }
+            self.panel.hide()
+        }
+        paste(text)
+        log(text)
+        NSLog("UltraWhisper: %.1fs audio, overlapped=%.0fms asr=%.0fms paste=%.0fms segments=%d fallback=%d",
+              seconds, overlapped, (tAsr - tStop) * 1000,
+              (CFAbsoluteTimeGetCurrent() - tAsr) * 1000,
+              take?.texts.count ?? 0, fallback ? 1 : 0)
     }
 
     // MARK: Transcribe
 
-    func transcribe(_ samples: [Float]) -> String {
-        // The warm server answers in ~0.3s. Right after launch it may still be
-        // loading the model, so retry briefly before falling back to the CLI.
-        if serverAlive() {
-            let payload = serverIsParakeet ? parakeetPayload(samples) : nil
-            for wait: TimeInterval in [0, 0.4, 0.8, 1.6, 3.2] {
+    func transcribe(_ samples: [Float], waitForServer: Bool = true) -> String {
+        // FluidAudio stays loaded in-process. Right after launch it may still
+        // be compiling CoreML, so retry briefly before falling back to whisper.
+        // Live segments skip the retry so a miss just marks the take unhealthy
+        // and the full buffer runs once at stop.
+        if cfg.engineName == "parakeet" {
+            let waits: [TimeInterval] = waitForServer ? [0, 0.4, 0.8, 1.6, 3.2] : [0]
+            for wait in waits {
                 if wait > 0 { Thread.sleep(forTimeInterval: wait) }
-                let text: String?
-                if serverIsParakeet {
-                    guard let payload = payload else { break }
-                    text = transcribeViaParakeet(payload)
-                } else {
-                    text = withTempWav(samples) { self.transcribeViaServer($0) }
+                if parakeet.isReady {
+                    return clean(parakeet.transcribe(samples))
                 }
-                if let text = text { return clean(text) }
+            }
+            if !waitForServer { return "" }
+            NSLog("UltraWhisper: FluidAudio not ready, falling back to whisper-cli")
+        } else if serverAlive() {
+            let waits: [TimeInterval] = waitForServer ? [0, 0.4, 0.8, 1.6, 3.2] : [0]
+            for wait in waits {
+                if wait > 0 { Thread.sleep(forTimeInterval: wait) }
+                if let text = withTempWav(samples, { self.transcribeViaServer($0) }) { return clean(text) }
                 if !serverAlive() { break }
             }
-        } else {
-            DispatchQueue.main.async { self.startServer() }   // heal it for the next take
+        } else if waitForServer {
+            DispatchQueue.main.async { self.startEngine() }
         }
+        if !waitForServer { return "" }
         return withTempWav(samples) { wav in
             let (out, _, _) = self.run(self.cfg.whisperPath, [
                 "-m", self.cfg.modelPath, "-f", wav.path, "-l", self.cfg.language,
@@ -614,17 +609,6 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let lines = out.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty && !$0.hasPrefix("[") && !$0.hasPrefix("(") }
         return lines.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    /// sherpa-onnx offline websocket payload:
-    /// [u32 sample-rate][u32 byte-count][float32 samples in -1..1].
-    func parakeetPayload(_ samples: [Float]) -> Data? {
-        guard !samples.isEmpty else { return nil }
-        var payload = Data(capacity: 8 + samples.count * 4)
-        withUnsafeBytes(of: UInt32(Capture.sampleRate).littleEndian) { payload.append(contentsOf: $0) }
-        withUnsafeBytes(of: UInt32(samples.count * 4).littleEndian) { payload.append(contentsOf: $0) }
-        samples.withUnsafeBufferPointer { payload.append(contentsOf: UnsafeRawBufferPointer($0)) }
-        return payload
     }
 
     /// Whisper fallback still wants a file. Parakeet never hits this.
@@ -654,34 +638,6 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         do { try data.write(to: url, options: .atomic); return true }
         catch { NSLog("UltraWhisper: wav write failed: \(error)"); return false }
-    }
-
-    /// One binary message in, one JSON message (carrying the transcript) out.
-    func transcribeViaParakeet(_ payload: Data) -> String? {
-        let task = URLSession.shared.webSocketTask(with: parakeetWS)
-        task.resume()
-        let sem = DispatchSemaphore(value: 0)
-        var result: String?
-        task.send(.data(payload)) { err in
-            if err != nil { sem.signal(); return }
-            task.receive { msg in
-                defer { sem.signal() }
-                var raw: String?
-                if case .success(.string(let s)) = msg { raw = s }
-                if case .success(.data(let d)) = msg { raw = String(data: d, encoding: .utf8) }
-                guard let raw = raw else { return }
-                if let data = raw.data(using: .utf8),
-                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                   let text = json["text"] as? String {
-                    result = text
-                } else {
-                    result = raw
-                }
-            }
-        }
-        if sem.wait(timeout: .now() + 15) == .timedOut { task.cancel(); return nil }
-        task.cancel(with: .normalClosure, reason: nil)
-        return result
     }
 
     func transcribeViaServer(_ wav: URL) -> String? {
@@ -922,17 +878,16 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let r = Hotkey.parse(cfg.recordHotkey) { recordHK = r }
         if let c = Hotkey.parse(cfg.cleanupHotkey) { cleanupHK = c }
         refreshIcon()
-        if checkModel(quiet: true) { startServer() }
+        if checkModel(quiet: true) { startEngine() }
     }
 
     // MARK: Model
 
     @discardableResult
-    /// Can the selected engine transcribe? Parakeet needs its sherpa files;
-    /// whisper (selected, or as the fallback) needs a ggml model, which we
-    /// offer to download.
+    /// Can the selected engine transcribe? Parakeet downloads/compiles CoreML
+    /// on first launch. Whisper needs a ggml model, which we offer to download.
     func checkModel(quiet: Bool) -> Bool {
-        if cfg.engineName == "parakeet" && parakeetReady() != nil { return true }
+        if cfg.engineName == "parakeet" { return true }
         if FileManager.default.fileExists(atPath: cfg.modelPath) { return true }
         if !quiet {
             DispatchQueue.main.async {
@@ -957,7 +912,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 try? FileManager.default.removeItem(atPath: dest)
                 try? FileManager.default.moveItem(atPath: dest + ".part", toPath: dest)
                 self.notify("Model ready", "\(name) downloaded. Press \(self.cfg.recordHotkey) to dictate.")
-                DispatchQueue.main.async { self.startServer() }
+                DispatchQueue.main.async { self.startEngine() }
             } else {
                 try? FileManager.default.removeItem(atPath: dest + ".part")
                 self.alert("Model download failed (curl exit \(code)).\n\(err.suffix(300))")

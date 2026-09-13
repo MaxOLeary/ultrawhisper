@@ -1,0 +1,144 @@
+takes scored: 69   words: 2761   disagreement (WER-style): 10.0%
+  vs Parakeet Multilanguage     66 takes    9.6%
+  vs S1-Voice (Cloud)            3 takes   17.3%
+  identical takes: 18/69   takes under 5%: 29
+
+Top substitutions  (superwhisper -> parakeet):
+    2  b -> v
+    2  also -> so
+    2  down -> dropdown
+    2  percent -> 20
+    2  us -> s
+    1  v -> five
+    1  wanted -> to
+    1  housekeeping -> keeping
+    1  maxmd -> md
+    1  in -> into
+    1  its -> and
+    1  charged -> off
+    1  28th -> to
+    1  know -> claude
+    1  and -> in
+    1  switches -> squishes
+    1  see -> the
+    1  three -> vt323
+    1  used -> use
+    1  and -> air
+    1  output -> put
+    1  is -> as
+    1  or -> ur
+    1  whenever -> ever
+    1  round -> around
+    1  wa -> w
+    1  it -> postit
+    1  sixty -> 60
+    1  wingspan -> span
+    1  hundred -> 300
+    1  so -> should
+    1  that'd -> that
+    1  exactly -> design
+    1  clear -> claude
+    1  measure -> or
+    1  5 -> five
+    1  as -> is
+    1  tmx -> tmux
+    1  cycle -> cyc
+    1  sorry -> sor
+
+Top words Parakeet dropped:
+   10  the
+    4  you
+    4  and
+    3  or
+    3  then
+    3  that
+    3  if
+    2  yeah
+    2  that's
+    2  three
+    2  is
+    2  towards
+    2  it
+    2  drop
+    2  of
+    2  this
+    2  twenty
+    2  to
+    1  tri
+    1  august
+
+Top words Parakeet added:
+    4  the
+    4  u
+    3  a
+    2  if
+    1  s
+    1  want
+    1  house
+    1  max
+    1  that
+    1  august
+    1  it's
+    1  charging
+    1  because
+    1  it
+    1  turns
+    1  on
+    1  but
+    1  and
+    1  28
+    1  i'll
+
+Worst takes:
+
+-- 1784421175 (Parakeet Multilanguage) 100% of 3 words
+  SW:  Mean two thumbs.
+  PK: You do that.
+
+-- 1783721652 (Parakeet Multilanguage) 100% of 1 words
+  SW:  And
+  PK: Air
+
+-- 1786829403 (Parakeet Multilanguage) 50% of 4 words
+  SW:  From Netherlands. Oh shit.
+  PK: From Netherlands.
+
+-- 1785446917 (Parakeet Multilanguage) 42% of 12 words
+  SW:  No one has ever built an autonomous vehicle of this size. And
+  PK: No one has ever built an Autonomous View. So
+
+-- 1785441595 (Parakeet Multilanguage) 36% of 11 words
+  SW:  Output another one is high quality PP or high quality PDF
+  PK: I'll put another one as high quality PP Ur High Quality PDF.
+
+-- 1786990346 (Parakeet Multilanguage) 35% of 20 words
+  SW:  I'm working on revising PDF per right now, so you know, K me it's not for the upper original yet.
+  PK: I'm working on revising CAD for right now, so you know, P is not for the operational yet.
+
+-- 1786650485 (Parakeet Multilanguage) 33% of 9 words
+  SW:  iPhone SE eight seven case black scratch resistant Wagaroo
+  PK: iPhone SE 87 Case Black Scratch Resistant Waggaroo
+
+-- 1786990558 (Parakeet Multilanguage) 31% of 29 words
+  SW:  There's a bug here in the courses and the moments page. There's this horizontal line that breaks and then is level just above total. Um that needs to hang up.
+  PK: There's a bug here in the forces and the Elements page. There's this horizontal line that breaks and then it's level just about t. That means.
+
+-- 1784342630 (Parakeet Multilanguage) 30% of 66 words
+  SW:  It should be measured in inches, so it's around uh sixty feet wingspan. And it should be around seventy meters per second. Uh like it should be like three hundred Should be like 400 knots at 40,000 feet, roughly. Um so 
+  PK: It should be measured in inches. So it's around 60 feet ring span. And it should be around seventy meters per second. Uh like it should be like 300 should be like 400 knots at 40,000 feet. Roughly. Uh Should that be comp
+
+-- 1784053470 (Parakeet Multilanguage) 29% of 7 words
+  SW:  Igor nigger, people, Kelly is the poopiest
+  PK: Nigger nigger, people, Kelly is the poopyist.
+
+-- 1786821185 (Parakeet Multilanguage) 25% of 135 words
+  SW:  Make the ocean a bit brighter. Also every US state needs to be visible as um you have to see every border and each name. What's more important to me than cities and all this stuff is state names, state borders, country 
+  PK: Make the Ocean a bit brighter. Also every US state needs to be visible as a you have to see every border and each name. State borders, country names, and country borders. So those should be more pronounced. Make the ocea
+
+-- 1785348571 (Parakeet Multilanguage) 22% of 63 words
+  SW:  I like number B. I like B, but maybe um make it a little slower. You know and C Yeah I like how it sort of displays what's going on like percentage and layers and sort of switches. Add that in. Also make it make the B m
+  PK: I like number V. I like V, but maybe. Make it a little slower. Claude. In C I like how it sort of displays what's going on, like percentage and layers and sort of squishes. Add that in. So make it make the B make the U g
+
+-- 1786830043 (Parakeet Multilanguage) 22% of 18 words
+  SW:  Currently the US is highlighted, but I only want states highlighted in the US, not the whole country.
+  PK: Currently the U.S. is highlighted, but I only want states highlighted in the U.S., not the whole country.

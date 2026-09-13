@@ -1,0 +1,112 @@
+takes scored: 190   words: 7424   disagreement (WER-style): 8.4%
+  vs Parakeet Multilanguage    163 takes    6.8%
+  vs S1-Voice (Cloud)           27 takes   20.2%
+  identical takes: 67/190   takes under 5%: 95
+
+Top substitutions  (superwhisper -> parakeet):
+    4  down -> dropdown
+    3  view -> paravue
+    3  and -> in
+    2  airshaper -> shaper
+    2  century -> sentry
+    2  b -> v
+    2  soulseq -> soulseek
+    2  in -> into
+    2  whisperer -> whisper
+    2  percent -> 20
+    2  is -> there's
+    2  000 -> thousand
+    2  kerning -> curning
+    2  markdown -> marktown
+    2  files -> piles
+    1  saw -> excellent
+    1  and -> then
+    1  words -> as
+    1  letters -> letter
+    1  pre -> meaning
+    1  shot -> pressure
+    1  per -> p
+    1  me -> p
+    1  original -> operation
+    1  solseek -> seek
+    1  asmrglow -> glow
+    1  sorry -> you
+    1  before -> post
+    1  posted -> it
+    1  wblock -> back
+
+Top words Parakeet dropped:
+   14  the
+   12  and
+   10  you
+    7  it
+    6  i
+    6  to
+    6  on
+    5  like
+    4  t
+    4  drop
+    3  make
+    3  para
+    3  one
+    3  a
+    3  that
+
+Top words Parakeet added:
+   10  the
+    6  and
+    3  that
+    3  a
+    2  so
+    2  air
+    2  like
+    2  think
+    2  in
+    2  on
+    2  as
+    2  it's
+    2  is
+    1  word
+    1  soul
+
+Worst takes:
+
+-- 1784421175 (Parakeet Multilanguage) 133% of 3 words
+  SW:  Mean two thumbs.
+  PK: Do you do that?
+
+-- 1788205652 (S1-Voice (Cloud)) 100% of 10 words
+  SW: I can't stand another night Stand another night Without you
+  PK: 
+
+-- 1788274455 (S1-Voice (Cloud)) 100% of 1 words
+  SW: You
+  PK: 
+
+-- 1783721652 (Parakeet Multilanguage) 100% of 1 words
+  SW:  And
+  PK: 
+
+-- 1787329625 (Parakeet Multilanguage) 87% of 15 words
+  SW:  Make me an STL of a teardrop shape and put the STL on the desktop.
+  PK: Make me hurt.
+
+-- 1783723980 (Parakeet Multilanguage) 80% of 5 words
+  SW:  I can kick you off
+  PK: Well I can.
+
+-- 1783483639 (Parakeet Multilanguage) 80% of 5 words
+  SW:  Okay. Um, look at the This
+  PK: Okay. Um
+
+-- 1783371434 (Parakeet Multilanguage) 75% of 4 words
+  SW:  Cracker, okay, I saw
+  PK: Okay. Excellent.
+
+-- 1788027766 (S1-Voice (Cloud)) 72% of 32 words
+  SW: Could we run a trans-yield for this live style? On like one word, saying "on the verse" or "we're doing my shows?" And then you can do it with your audio
+  PK: Could we run a train for the train you can do that way?
+
+-- 1787947038 (S1-Voice (Cloud)) 56% of 9 words
+  SW: Sorry revert that last message. That wasn't before posted
+  PK: So you revert that last message. That wasn't for post it.
