@@ -1,11 +1,11 @@
-// UltraWhisper - local push-to-talk dictation for macOS.
+// Whisper - local push-to-talk dictation for macOS.
 //
 // Tap the hotkey, talk, tap again. Mic PCM (AVAudioEngine, 16 kHz in RAM) is
 // segmented on pauses and decoded while you speak (FluidAudio Parakeet TDT
 // on the Neural Engine), then pasted via clipboard -> Cmd+V into whatever
 // has focus, then the old clipboard comes back.
 // Everything runs on this Mac; nothing leaves it unless you opt into
-// cleanup mode in ~/.config/ultrawhisper/.env (local Ollama, or xAI Grok —
+// cleanup mode in ~/.config/whisper/.env (local Ollama, or xAI Grok —
 // never OpenAI/Google/Anthropic endpoints).
 //
 // Build: ./build.sh   (see README.md)
@@ -34,7 +34,7 @@ struct Config: Codable {
     var hotwordsScore: Double?   // set (e.g. 1) to turn on vocabulary.txt hotwords; nil = off
 
     static let dir = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent(".config/ultrawhisper", isDirectory: true)
+        .appendingPathComponent(".config/whisper", isDirectory: true)
     static let file = dir.appendingPathComponent("config.json")
     static let envFile = dir.appendingPathComponent(".env")
     static let modelsDir = dir.appendingPathComponent("models", isDirectory: true)
@@ -100,13 +100,13 @@ struct Config: Codable {
             (vocabularyFile, """
             # Words Parakeet should lean toward when unsure. One per line.
             # Unused until FluidAudio vocabulary boosting is wired. See README.
-            UltraWhisper
+            Whisper
 
             """),
             (replacementsFile, """
             # Plain find-and-replace on every take: heard -> wanted
             # Left side matches whole words, any capitalization. No AI involved.
-            ultra whisper -> UltraWhisper
+            vortex cfd -> VortexCFD
 
             """),
         ]
@@ -136,7 +136,7 @@ struct Config: Codable {
             .filter { !$0.isEmpty && !$0.hasPrefix("#") }
     }
 
-    /// Reads KEY=VALUE lines from ~/.config/ultrawhisper/.env (no accounts, no telemetry).
+    /// Reads KEY=VALUE lines from ~/.config/whisper/.env (no accounts, no telemetry).
     static func env() -> [String: String] {
         var out: [String: String] = [:]
         for line in lines(of: envFile) {
@@ -241,14 +241,13 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     var statusItem: NSStatusItem!
     var state: State = .idle { didSet { DispatchQueue.main.async { self.refreshIcon() } } }
-    var discardPrompt = false   // Esc during a take shows "Discard recording?"
     var history: [Transcript] = []
 
     var tap: CFMachPort?
     let panel = WavePanel()
     let capture = Capture()
     let segmenter = Segmenter()
-    let work = DispatchQueue(label: "ultrawhisper.work")
+    let work = DispatchQueue(label: "whisper.work")
     var takeGen = 0
     var take: StreamTake?
 
@@ -310,7 +309,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func startWhisperServer() {
         let exe = URL(fileURLWithPath: cfg.whisperPath).deletingLastPathComponent().appendingPathComponent("whisper-server")
         guard FileManager.default.fileExists(atPath: exe.path) else {
-            NSLog("UltraWhisper: no whisper-server next to whisper-cli; falling back to whisper-cli per press")
+            NSLog("Whisper: no whisper-server next to whisper-cli; falling back to whisper-cli per press")
             return
         }
         let p = Process()
@@ -319,7 +318,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
                        "--host", "127.0.0.1", "--port", String(cfg.serverPort)]
         p.standardOutput = FileHandle.nullDevice
         p.standardError = FileHandle.nullDevice
-        do { try p.run(); server = p } catch { NSLog("UltraWhisper: whisper-server failed: \(error)") }
+        do { try p.run(); server = p } catch { NSLog("Whisper: whisper-server failed: \(error)") }
     }
 
     func serverAlive() -> Bool {
@@ -328,7 +327,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func fatal(_ msg: String) -> Never {
-        let a = NSAlert(); a.messageText = "UltraWhisper"; a.informativeText = msg; a.runModal()
+        let a = NSAlert(); a.messageText = "Whisper"; a.informativeText = msg; a.runModal()
         exit(1)
     }
 
@@ -347,7 +346,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                 callback: callback,
                                 userInfo: Unmanaged.passUnretained(self).toOpaque())
         guard let tap = tap else {
-            NSLog("UltraWhisper: could not create event tap (Accessibility not granted?)")
+            NSLog("Whisper: could not create event tap (Accessibility not granted?)")
             return
         }
         let src = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
@@ -389,21 +388,12 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
             }
         case .recording:
-            // Tap the chord again to stop and paste. Esc asks first:
-            // Return discards, Esc again resumes.
+            // Tap the chord again to stop and paste. Esc closes the card on
+            // the spot, no confirmation: the take is still transcribed and
+            // saved to history and ~/Dictation, it just does not paste.
             if type == .keyDown {
                 if event.getIntegerValueField(.keyboardEventAutorepeat) != 0 { return nil }
-                let returnKey: Int64 = 36
-                if key == escape {
-                    discardPrompt.toggle()
-                    let showing = discardPrompt
-                    DispatchQueue.main.async {
-                        if showing { self.panel.discardPrompt(hotkey: self.cfg.recordHotkey) }
-                        else { self.panel.resumeWave(hotkey: self.cfg.recordHotkey) }
-                    }
-                    return nil
-                }
-                if key == returnKey, discardPrompt { cancelRecording(); return nil }
+                if key == escape { stopRecording(shouldPaste: false); return nil }
                 for (hk, _) in chords where hk.keyCode == key && hk.modifiersHeld(flags) {
                     stopRecording(); return nil
                 }
@@ -444,7 +434,6 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             alert("Couldn't open the microphone.")
             return
         }
-        discardPrompt = false
         state = .recording(mode)
         if cfg.sounds { NSSound(named: "Tink")?.play() }
         DispatchQueue.main.async {
@@ -452,28 +441,22 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    func cancelRecording() {
-        guard case .recording = state else { return }
-        discardPrompt = false
-        takeGen += 1
-        take = nil
-        state = .idle
-        _ = capture.stop()
-        work.async { self.segmenter.reset() }
-        DispatchQueue.main.async { self.panel.hide() }
-    }
-
-    func stopRecording() {
+    /// Second hotkey tap: stop, transcribe, paste. Esc: same, but the card
+    /// closes now and nothing is pasted (`shouldPaste == false`).
+    func stopRecording(shouldPaste: Bool = true) {
         guard case .recording(let mode) = state else { return }
-        discardPrompt = false
         state = .transcribing
         if cfg.sounds { NSSound(named: "Pop")?.play() }
         let samples = capture.stop()
         let gen = take?.gen ?? takeGen
         let tStop = CFAbsoluteTimeGetCurrent()
-        DispatchQueue.main.async { self.panel.transcribing() }
+        DispatchQueue.main.async {
+            if shouldPaste { self.panel.transcribing() } else { self.panel.hide() }
+        }
 
-        work.async { self.finishTake(samples: samples, mode: mode, gen: gen, tStop: tStop) }
+        work.async {
+            self.finishTake(samples: samples, mode: mode, gen: gen, tStop: tStop, shouldPaste: shouldPaste)
+        }
     }
 
     func ingest(_ samples: [Float], gen: Int) {
@@ -493,14 +476,14 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let secs = Double(chunk.samples.count) / Capture.sampleRate
         if text.isEmpty {
             take.unhealthy = true
-            NSLog("UltraWhisper: segment %.1fs empty in %.0fms — will fall back", secs, dt)
+            NSLog("Whisper: segment %.1fs empty in %.0fms — will fall back", secs, dt)
         } else {
             take.texts.append(text)
-            NSLog("UltraWhisper: segment %.1fs in %.0fms", secs, dt)
+            NSLog("Whisper: segment %.1fs in %.0fms", secs, dt)
         }
     }
 
-    func finishTake(samples: [Float], mode: Mode, gen: Int, tStop: CFAbsoluteTime) {
+    func finishTake(samples: [Float], mode: Mode, gen: Int, tStop: CFAbsoluteTime, shouldPaste: Bool) {
         var pasted = false
         defer {
             self.take = nil
@@ -545,7 +528,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let tAsr = CFAbsoluteTimeGetCurrent()
         guard !text.isEmpty else {
             if cfg.sounds { DispatchQueue.main.async { NSSound(named: "Basso")?.play() } }
-            NSLog("UltraWhisper: %.1fs audio, overlapped=%.0fms asr=%.0fms empty fallback=%d",
+            NSLog("Whisper: %.1fs audio, overlapped=%.0fms asr=%.0fms empty fallback=%d",
                   seconds, overlapped, (tAsr - tStop) * 1000, fallback ? 1 : 0)
             return
         }
@@ -559,9 +542,9 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if self.history.count > 10 { self.history.removeLast(self.history.count - 10) }
             self.panel.hide()
         }
-        paste(text)
+        if shouldPaste { paste(text) }
         log(text)
-        NSLog("UltraWhisper: %.1fs audio, overlapped=%.0fms asr=%.0fms paste=%.0fms segments=%d fallback=%d",
+        NSLog("Whisper: %.1fs audio, overlapped=%.0fms asr=%.0fms paste=%.0fms segments=%d fallback=%d",
               seconds, overlapped, (tAsr - tStop) * 1000,
               (CFAbsoluteTimeGetCurrent() - tAsr) * 1000,
               take?.texts.count ?? 0, fallback ? 1 : 0)
@@ -583,7 +566,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
             }
             if !waitForServer { return "" }
-            NSLog("UltraWhisper: FluidAudio not ready, falling back to whisper-cli")
+            NSLog("Whisper: FluidAudio not ready, falling back to whisper-cli")
         } else if serverAlive() {
             let waits: [TimeInterval] = waitForServer ? [0, 0.4, 0.8, 1.6, 3.2] : [0]
             for wait in waits {
@@ -614,7 +597,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Whisper fallback still wants a file. Parakeet never hits this.
     func withTempWav(_ samples: [Float], _ body: (URL) -> String?) -> String? {
         let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("ultrawhisper-\(UUID().uuidString).wav")
+            .appendingPathComponent("whisper-\(UUID().uuidString).wav")
         defer { try? FileManager.default.removeItem(at: url) }
         guard writeWav(samples, to: url) else { return nil }
         return body(url)
@@ -637,12 +620,12 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             withUnsafeBytes(of: v) { data.append(contentsOf: $0) }
         }
         do { try data.write(to: url, options: .atomic); return true }
-        catch { NSLog("UltraWhisper: wav write failed: \(error)"); return false }
+        catch { NSLog("Whisper: wav write failed: \(error)"); return false }
     }
 
     func transcribeViaServer(_ wav: URL) -> String? {
         guard let data = try? Data(contentsOf: wav) else { return nil }
-        let boundary = "ultrawhisper-\(UUID().uuidString)"
+        let boundary = "whisper-\(UUID().uuidString)"
         var body = Data()
         func field(_ name: String, _ value: String) {
             body.append("--\(boundary)\r\nContent-Disposition: form-data; name=\"\(name)\"\r\n\r\n\(value)\r\n".data(using: .utf8)!)
@@ -664,7 +647,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         URLSession.shared.dataTask(with: req) { d, r, e in
             defer { sem.signal() }
             guard let d = d, e == nil, (r as? HTTPURLResponse)?.statusCode == 200 else {
-                NSLog("UltraWhisper server error: \(e?.localizedDescription ?? "http")"); return
+                NSLog("Whisper server error: \(e?.localizedDescription ?? "http")"); return
             }
             result = String(data: d, encoding: .utf8)
         }.resume()
@@ -714,12 +697,12 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             defer { sem.signal() }
             guard let data = data, err == nil,
                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                NSLog("UltraWhisper cleanup failed: \(err?.localizedDescription ?? "no data")"); return
+                NSLog("Whisper cleanup failed: \(err?.localizedDescription ?? "no data")"); return
             }
             if let s = extract(json)?.trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty {
                 result = s
             } else {
-                NSLog("UltraWhisper cleanup: unexpected response shape (body not logged)")
+                NSLog("Whisper cleanup: unexpected response shape (body not logged)")
             }
         }.resume()
         sem.wait()
@@ -819,7 +802,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let b = statusItem.button else { return }
         let (tint, tip): (NSColor?, String)
         switch state {
-        case .idle: (tint, tip) = (nil, "UltraWhisper: press \(cfg.recordHotkey) to dictate")
+        case .idle: (tint, tip) = (nil, "Whisper: press \(cfg.recordHotkey) to dictate")
         case .recording: (tint, tip) = (.systemRed, "Recording…")
         case .transcribing: (tint, tip) = (.systemOrange, "Transcribing…")
         }
@@ -862,7 +845,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(withTitle: "Download base.en Model (~150 MB)", action: #selector(downloadModel), keyEquivalent: "").target = self
         }
         menu.addItem(.separator())
-        menu.addItem(withTitle: "Quit UltraWhisper", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        menu.addItem(withTitle: "Quit Whisper", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
     }
 
     @objc func copyTranscript(_ sender: NSMenuItem) {
@@ -938,7 +921,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func alert(_ msg: String) {
         DispatchQueue.main.async {
-            let a = NSAlert(); a.messageText = "UltraWhisper"; a.informativeText = msg; a.runModal()
+            let a = NSAlert(); a.messageText = "Whisper"; a.informativeText = msg; a.runModal()
         }
     }
 

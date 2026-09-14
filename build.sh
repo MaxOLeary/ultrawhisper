@@ -1,39 +1,39 @@
 #!/bin/bash
-# Compiles UltraWhisper via SwiftPM, signs it, installs to /Applications.
+# Compiles Whisper via SwiftPM, signs it, installs to /Applications.
 set -e
 cd "$(dirname "$0")"
 
-APP="UltraWhisper.app"
-BIN="$APP/Contents/MacOS/UltraWhisper"
+APP="Whisper.app"
+BIN="$APP/Contents/MacOS/Whisper"
 
-swift build -c release --product UltraWhisper --arch arm64
+swift build -c release --product Whisper --arch arm64
 REL="$(swift build -c release --arch arm64 --show-bin-path)"
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"
-cp "$REL/UltraWhisper" "$BIN"
+cp "$REL/Whisper" "$BIN"
 
 mkdir -p "$APP/Contents/Resources"
-cp icon/UltraWhisper.icns "$APP/Contents/Resources/"
+cp icon/Whisper.icns "$APP/Contents/Resources/"
 
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>CFBundleName</key>            <string>UltraWhisper</string>
-    <key>CFBundleDisplayName</key>     <string>UltraWhisper</string>
-    <key>CFBundleIdentifier</key>      <string>com.maxoleary.ultrawhisper</string>
+    <key>CFBundleName</key>            <string>Whisper</string>
+    <key>CFBundleDisplayName</key>     <string>Whisper</string>
+    <key>CFBundleIdentifier</key>      <string>com.maxoleary.whisper</string>
     <key>CFBundleVersion</key>         <string>1.0</string>
     <key>CFBundleShortVersionString</key><string>1.0</string>
     <key>CFBundlePackageType</key>     <string>APPL</string>
-    <key>CFBundleExecutable</key>      <string>UltraWhisper</string>
+    <key>CFBundleExecutable</key>      <string>Whisper</string>
     <key>LSMinimumSystemVersion</key>  <string>14.0</string>
     <key>NSHighResolutionCapable</key> <true/>
     <key>LSUIElement</key>             <true/>
-    <key>CFBundleIconFile</key>         <string>UltraWhisper</string>
+    <key>CFBundleIconFile</key>         <string>Whisper</string>
     <key>NSMicrophoneUsageDescription</key>
-    <string>UltraWhisper records your voice while you hold the hotkey so it can transcribe it locally.</string>
+    <string>Whisper records your voice while you hold the hotkey so it can transcribe it locally.</string>
 </dict>
 </plist>
 PLIST
@@ -52,7 +52,7 @@ else
     codesign --force -s - "$STAGE/$APP"
 fi
 
-pkill -x UltraWhisper 2>/dev/null || true
+pkill -x Whisper 2>/dev/null || true
 pkill -x whisper-server 2>/dev/null || true
 pkill -f sherpa-onnx-offline-websocket-server 2>/dev/null || true
 rm -rf "/Applications/$APP"

@@ -3,7 +3,7 @@ import AppKit
 // MARK: - Floating waveform panel
 
 /// What the card is currently showing.
-enum PanelState { case wave, discard, busy }
+enum PanelState { case wave, busy }
 
 final class WaveView: NSView {
     var state: PanelState = .wave
@@ -12,7 +12,7 @@ final class WaveView: NSView {
     private var bars: [CGFloat] = []        // scrolled history, oldest first
     private var ticks = 0
     private var phase = 0.0                 // transcribing-spindle clock
-    var footerLeft = "Ultra"
+    var footerLeft = "Whisper"
     var footerDim = false                   // transcribing dims the whole footer
     var footerRight: [(String, String?)] = []   // (label, keycap)
 
@@ -55,7 +55,7 @@ final class WaveView: NSView {
     /// One animation frame. Recording: the wave is a ticker of the last few
     /// seconds - a new bar lands at the right edge every ~80ms and the rest
     /// slide left, so words read as spindle-shaped blobs.
-    /// Transcribing: the bars form a soft breathing spindle in the center.
+    /// Transcribing: a soft ripple slides across the bars from right to left.
     func tick() {
         switch state {
         case .wave:
@@ -67,8 +67,6 @@ final class WaveView: NSView {
             }
         case .busy:
             phase += 1.0 / 30
-        case .discard:
-            return   // static card, nothing to animate
         }
         // Only the bars move frame to frame; leave the card and footer alone.
         setNeedsDisplay(waveArea.insetBy(dx: 0, dy: -4))
@@ -87,10 +85,7 @@ final class WaveView: NSView {
 
         drawFooter(rect)
 
-        switch state {
-        case .wave, .busy: drawBars()
-        case .discard: drawDiscard()
-        }
+        drawBars()
     }
 
     /// Footer row: no band, no divider - just a dim
@@ -140,6 +135,7 @@ final class WaveView: NSView {
         let area = waveArea
         let n = slots
         var levels = [CGFloat](repeating: 0, count: n)
+        var busyAlpha = [CGFloat](repeating: 0.65, count: n)   // brighter on the crests
         switch state {
         case .wave:
             // Right-aligned history plus a live bar hugging the right edge.
@@ -148,14 +144,16 @@ final class WaveView: NSView {
             for (i, v) in recent.enumerated() { levels[start + i] = v }
             levels[n - 1] = min(1, pow(smoothLevel * 1.35, 0.9))
         case .busy:
-            // Breathing spindle: a soft hump that drifts and swells in place.
-            let c = 0.5 + 0.10 * sin(phase * 1.9)
-            let w = 0.20 + 0.05 * sin(phase * 2.7 + 1)
+            // Ripple: one long, gentle sine sliding right to left, tapered at
+            // both ends so it fades into the edges. `+ phase` is what makes it
+            // travel leftward; 0.9 cycles/s, 2.2 waves across the card.
             for i in 0..<n {
-                let d = (Double(i) / Double(n - 1) - c) / w
-                levels[i] = CGFloat(0.62 * exp(-d * d))
+                let x = Double(i) / Double(n - 1)
+                let env = pow(sin(.pi * x), 0.6)
+                let s = 0.5 + 0.5 * sin(2 * .pi * (x * 2.2 + phase * 0.9))
+                levels[i] = CGFloat(0.08 + 0.55 * env * s)
+                busyAlpha[i] = CGFloat(0.45 + 0.35 * s)
             }
-        default: return
         }
         let mid = area.midY
         let maxH = area.height
@@ -165,7 +163,7 @@ final class WaveView: NSView {
             let lv = levels[i]
             let h = max(1.6, lv * maxH)
             let alpha: CGFloat = h <= 1.6 ? 0.30
-                : state == .busy ? 0.65
+                : state == .busy ? busyAlpha[i]
                 : 0.40 + 0.60 * min(1, lv * 1.5)
             NSColor(calibratedWhite: 1, alpha: alpha).setFill()
             let r = NSRect(x: x0 + CGFloat(i) * Self.pitch, y: mid - h / 2, width: Self.barW, height: h)
@@ -173,25 +171,6 @@ final class WaveView: NSView {
         }
     }
 
-    /// Esc during a take: "Discard recording? [↩]" (Return discards, Esc resumes).
-    private func drawDiscard() {
-        let area = waveArea
-        let font = NSFont.systemFont(ofSize: 15, weight: .medium)
-        let attrs: [NSAttributedString.Key: Any] =
-            [.font: font, .foregroundColor: NSColor(calibratedWhite: 1, alpha: 0.9)]
-        let text = "Discard recording?" as NSString
-        let tw = text.size(withAttributes: attrs).width
-        let capFont = NSFont.systemFont(ofSize: 12, weight: .semibold)
-        let cap = "↩" as NSString
-        let capW = cap.size(withAttributes: [.font: capFont]).width + 14
-        let x = area.midX - (tw + 8 + capW) / 2
-        text.draw(at: NSPoint(x: x, y: area.midY - 9), withAttributes: attrs)
-        let capRect = NSRect(x: x + tw + 8, y: area.midY - 10, width: capW, height: 20)
-        NSColor(calibratedWhite: 1, alpha: 0.13).setFill()
-        NSBezierPath(roundedRect: capRect, xRadius: 5, yRadius: 5).fill()
-        cap.draw(at: NSPoint(x: capRect.minX + 7, y: capRect.midY - 7.5),
-                 withAttributes: [.font: capFont, .foregroundColor: NSColor(calibratedWhite: 1, alpha: 0.9)])
-    }
 }
 
 final class WavePanel: NSPanel {
@@ -244,10 +223,16 @@ final class WavePanel: NSPanel {
     func show(mode: Mode, hotkey: String) {
         wave.reset()
         wave.footerDim = false
-        wave.footerLeft = mode == .cleanup ? "Cleanup" : "Ultra"
-        wave.footerRight = [("Stop", nil)] + keycaps(hotkey) + [("Cancel", "esc")]
+        wave.footerLeft = mode == .cleanup ? "Cleanup" : "Whisper"
+        wave.footerRight = [("Stop", nil)] + keycaps(hotkey) + [("Close", "esc")]
         place()
         wave.needsDisplay = true
+        // Re-assert "show on every Space" each time. The window server can
+        // drop this tag (seen after a sleep/wake, or after the card was
+        // dragged) and pin the panel to one Space, so the card only appeared
+        // on a desktop the user was not looking at while dictation kept
+        // working. Setting it again right before ordering front re-tags it.
+        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         // The card fades in quickly rather than popping.
         if !isVisible {
             alphaValue = 0
@@ -269,20 +254,6 @@ final class WavePanel: NSPanel {
             guard let self, self.isVisible else { return }
             self.place()
         }
-    }
-
-    /// Esc during a take: ask before throwing the recording away.
-    func discardPrompt(hotkey: String) {
-        wave.state = .discard
-        wave.footerRight = [("Stop", nil)] + keycaps(hotkey) + [("Continue", "esc")]
-        wave.needsDisplay = true
-    }
-
-    /// Esc again on the prompt: back to the live waveform.
-    func resumeWave(hotkey: String) {
-        wave.state = .wave
-        wave.footerRight = [("Stop", nil)] + keycaps(hotkey) + [("Cancel", "esc")]
-        wave.needsDisplay = true
     }
 
     func transcribing() {

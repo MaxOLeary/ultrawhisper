@@ -2,12 +2,12 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>Label</key>            <string>com.maxoleary.ultrawhisper</string>
+    <key>Label</key>            <string>com.maxoleary.whisper</string>
     <key>ProgramArguments</key>
     <array>
         <string>/usr/bin/open</string>
         <string>-a</string>
-        <string>/Applications/UltraWhisper.app</string>
+        <string>/Applications/Whisper.app</string>
     </array>
     <key>RunAtLoad</key>        <true/>
     <key>ProcessType</key>      <string>Interactive</string>

@@ -23,14 +23,14 @@ final class ParakeetEngine: @unchecked Sendable {
 
     private func load() async {
         do {
-            NSLog("UltraWhisper: loading FluidAudio Parakeet TDT v3")
+            NSLog("Whisper: loading FluidAudio Parakeet TDT v3")
             let models = try await AsrModels.downloadAndLoad(version: .v3)
             try await asr.loadModels(models)
             ready.withLock { $0 = true }
-            NSLog("UltraWhisper: FluidAudio ready")
+            NSLog("Whisper: FluidAudio ready")
         } catch {
             ready.withLock { $0 = false }
-            NSLog("UltraWhisper: FluidAudio load failed: \(error)")
+            NSLog("Whisper: FluidAudio load failed: \(error)")
         }
         loading.withLock { $0 = false }
     }
@@ -49,7 +49,7 @@ final class ParakeetEngine: @unchecked Sendable {
                 let result = try await self.asr.transcribe(samples, decoderState: &state)
                 box.text = result.text
             } catch {
-                NSLog("UltraWhisper: FluidAudio \(error)")
+                NSLog("Whisper: FluidAudio \(error)")
             }
         }
         _ = sem.wait(timeout: .now() + 30)

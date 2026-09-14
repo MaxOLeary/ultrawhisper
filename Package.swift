@@ -2,17 +2,17 @@
 import PackageDescription
 
 let package = Package(
-    name: "UltraWhisper",
+    name: "Whisper",
     platforms: [.macOS(.v14)],
     products: [
-        .executable(name: "UltraWhisper", targets: ["UltraWhisper"])
+        .executable(name: "Whisper", targets: ["Whisper"])
     ],
     dependencies: [
         .package(url: "https://github.com/FluidInference/FluidAudio.git", from: "0.15.7", traits: [])
     ],
     targets: [
         .executableTarget(
-            name: "UltraWhisper",
+            name: "Whisper",
             dependencies: [
                 .product(name: "FluidAudio", package: "FluidAudio")
             ],
@@ -24,8 +24,8 @@ let package = Package(
                 "SPEC.md",
                 "eval",
                 "icon",
-                "UltraWhisper.app",
-                "com.maxoleary.ultrawhisper.plist",
+                "Whisper.app",
+                "com.maxoleary.whisper.plist",
             ],
             swiftSettings: [
                 .swiftLanguageMode(.v5)

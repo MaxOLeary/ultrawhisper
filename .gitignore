@@ -1,6 +1,6 @@
 .DS_Store
 .env
-UltraWhisper.app/
+Whisper.app/
 PushTalk.app/
 models/
 .build/
@@ -9,14 +9,15 @@ log.txt
 
 # Local icon scratch — old drafts and reference files, not part of the app.
 icon/superwhisper-original.icns
-icon/UltraWhisper-old.icns
+icon/Whisper-old.icns
 icon/flipped-256.png
 icon/menubar@2x.png
 icon/mkmenubar.swift
 icon/preview-menubar.png
 icon/menubar-white*
-icon/UltraWhisper.iconset/
+icon/Whisper.iconset/
 
 # Eval junk
 eval/__pycache__/
 eval/*.log
+.lavish/

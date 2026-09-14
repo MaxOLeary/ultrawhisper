@@ -64,7 +64,7 @@ final class Capture {
             if running { self.onChunk?(chunk) }
         }
         do { try e.start(); engine = e; return true } catch {
-            NSLog("UltraWhisper capture: \(error)")
+            NSLog("Whisper capture: \(error)")
             input.removeTap(onBus: 0)
             converter = nil
             return false
