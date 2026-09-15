@@ -21,3 +21,6 @@ icon/Whisper.iconset/
 eval/__pycache__/
 eval/*.log
 .lavish/
+
+# Stale sherpa-era eval outputs
+eval/*.jsonl

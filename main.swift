@@ -11,6 +11,7 @@
 // Build: ./build.sh   (see README.md)
 
 import AppKit
+import AVFoundation
 import Foundation
 
 // MARK: - Config
@@ -19,7 +20,7 @@ struct Config: Codable {
     var modelPath: String
     var ffmpegPath: String
     var whisperPath: String
-    var audioDevice: String      // avfoundation device index ("0") or name substring
+    var audioDevice: String      // mic localizedName as shown in the menu; "" or "0" = system default
     var threads: Int
     var serverPort: Int          // whisper-server keeps the model warm in RAM
     var language: String
@@ -29,6 +30,8 @@ struct Config: Codable {
     var minSeconds: Double       // ignore taps shorter than this
     var cleanupPrompt: String
     // Optional so an older config.json still decodes; nil means the default.
+    var startSound: String?      // system sound name; nil = Tink; "" / "none" = silent
+    var stopSound: String?       // nil = Pop
     var engine: String?          // "parakeet" (default) or "whisper"
     var parakeetModel: String?   // folder under models/; nil = best installed build
     var hotwordsScore: Double?   // set (e.g. 1) to turn on vocabulary.txt hotwords; nil = off
@@ -61,8 +64,18 @@ struct Config: Codable {
                 + "remove filler words (um, uh, like, you know), fix obvious transcription "
                 + "slips, keep the speaker's wording and meaning otherwise. Return only the "
                 + "cleaned text, no commentary, no quotes.",
+            startSound: "Tink",
+            stopSound: "Pop",
             engine: "parakeet"
         )
+    }
+
+    /// System sound name to play, or "" for silence. Missing key uses `fallback`.
+    static func soundName(_ stored: String?, fallback: String) -> String {
+        guard let stored else { return fallback }
+        let s = stored.trimmingCharacters(in: .whitespaces)
+        if s.isEmpty || s.lowercased() == "none" { return "" }
+        return s
     }
 
     /// replacements.txt: one `heard -> wanted` per line, # comments allowed.
@@ -127,6 +140,24 @@ struct Config: Codable {
         if let data = try? enc.encode(cfg) { try? data.write(to: file) }
         writeTemplates()
         return cfg
+    }
+
+    /// Merge a few keys into config.json without touching anything else in
+    /// it, so hand-edited or unknown keys survive a UI save. If the file is
+    /// missing or not valid JSON right now, start from `current` (the config
+    /// the app is running with) instead of an empty dict, so a later load()
+    /// can never fall back to defaults because of a UI save.
+    static func save(patch: [String: Any], current: Config) {
+        var dict = (try? JSONSerialization.jsonObject(with: Data(contentsOf: file))) as? [String: Any]
+        if dict == nil, let data = try? JSONEncoder().encode(current) {
+            dict = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        }
+        var out = dict ?? [:]
+        for (k, v) in patch { out[k] = v }
+        if let data = try? JSONSerialization.data(withJSONObject: out,
+                                                  options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]) {
+            try? data.write(to: file, options: .atomic)
+        }
     }
 
     /// Non-blank, non-comment lines of a text file, trimmed. Missing file = [].
@@ -202,6 +233,34 @@ struct Hotkey {
         return (hk.flags.isEmpty && hk.keyCode == nil) ? nil : hk
     }
 
+    /// `cmd+alt+space` from a keyDown. Needs at least one modifier, or an F-key,
+    /// so a stray letter never becomes the record chord. Nil = keep listening.
+    static func string(flags: CGEventFlags, keyCode: Int64) -> String? {
+        guard let name = namesByCode[keyCode] else { return nil }
+        let hasMod = !flags.intersection(modifierMask).isEmpty
+        let isFn = fnCodes.contains(keyCode)
+        guard hasMod || isFn else { return nil }
+        var parts: [String] = []
+        if flags.contains(.maskCommand) { parts.append("cmd") }
+        if flags.contains(.maskAlternate) { parts.append("alt") }
+        if flags.contains(.maskShift) { parts.append("shift") }
+        if flags.contains(.maskControl) { parts.append("ctrl") }
+        parts.append(name)
+        return parts.joined(separator: "+")
+    }
+
+    /// Canonical token per key code. Aliases in `keyCodes` collapse here
+    /// (enter -> return, esc -> escape).
+    static let namesByCode: [Int64: String] = {
+        var out: [Int64: String] = [:]
+        for (name, code) in keyCodes where out[code] == nil { out[code] = name }
+        for name in ["space", "return", "tab", "escape", "delete", "grave", "minus", "equal"] {
+            if let c = keyCodes[name] { out[c] = name }
+        }
+        return out
+    }()
+
+    static let fnCodes: Set<Int64> = [122, 120, 99, 118, 96, 97, 98, 100, 101, 109, 103, 111]
     static let modifierMask: CGEventFlags = [.maskCommand, .maskAlternate, .maskShift, .maskControl]
 
     /// True when exactly these modifiers (and the right-side bits, if any) are held.
@@ -214,9 +273,11 @@ struct Hotkey {
 // MARK: - State
 
 enum Mode { case plain, cleanup }
-enum State { case idle, recording(Mode), transcribing }
+/// Where a take is. Named RecordState so it never shadows SwiftUI.State.
+enum RecordState { case idle, recording(Mode), transcribing }
 
-struct Transcript {
+struct Transcript: Identifiable {
+    let id = UUID()
     let date: Date
     let text: String
 }
@@ -240,16 +301,33 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var cleanupHK: Hotkey!
 
     var statusItem: NSStatusItem!
-    var state: State = .idle { didSet { DispatchQueue.main.async { self.refreshIcon() } } }
-    var history: [Transcript] = []
+    var state: RecordState = .idle {
+        didSet { DispatchQueue.main.async { self.refreshIcon(); self.store.state = self.state } }
+    }
+    /// Bridge to the SwiftUI window (UI/SettingsWindow.swift).
+    let store = AppStore()
+    lazy var settings = SettingsWindowController(store: store)
+    /// Which mode the menu's Toggle Recording uses (the hotkeys pick their own).
+    var menuMode: Mode = .plain
+    static let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev"
+    var history: [Transcript] = [] { didSet { store.history = history } }
 
     var tap: CFMachPort?
+    var preview: NSSound?
     let panel = WavePanel()
     let capture = Capture()
     let segmenter = Segmenter()
     let work = DispatchQueue(label: "whisper.work")
     var takeGen = 0
     var take: StreamTake?
+    /// Postit meeting: WavePanel footer says Debrief, stop writes a note, no paste.
+    var meetingActive = false
+    /// Bumped on start and on Esc cancel so an in-flight finishMeeting drops the take.
+    var meetingGen = 0
+    /// Original clipboard, held until the delayed restore. Shared across
+    /// overlapping pastes so a second take does not snapshot the first take.
+    var savedClipboard: [[NSPasteboard.PasteboardType: Data]]?
+    var clipboardRestore: DispatchWorkItem?
 
     static let dictationDir = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Dictation", isDirectory: true)
@@ -266,9 +344,28 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         let menu = NSMenu(); menu.delegate = self
+        menu.autoenablesItems = false   // we set isEnabled ourselves in menuNeedsUpdate
         statusItem.menu = menu
         refreshIcon()
+        installMainMenu()
+        store.toggleRecording = { [weak self] in self?.toggleRecording() }
+        store.save = { [weak self] patch in self?.updateConfig(patch) }
+        store.refresh = { [weak self] in self?.refreshUIState() }
+        store.captureHotkey = { [weak self] field in self?.beginHotkeyCapture(field) }
+        store.openItem = { [weak self] id in self?.openItem(id) }
+        store.setLaunchAtLogin = { [weak self] on in self?.setLaunchAtLogin(on) }
+        store.downloadModel = { [weak self] in self?.downloadModel() }
+        store.playSound = { [weak self] name in self?.previewSound(name) }
+        syncStore()
+        refreshUIState()
+        // Dev hook, same as clicking Settings… in the dropdown. Post it from any
+        // process with DistributedNotificationCenter (see eval/open-settings.swift).
+        // It only opens the window; nothing else is reachable this way.
+        DistributedNotificationCenter.default().addObserver(
+            forName: Notification.Name("com.maxoleary.whisper.openSettings"), object: nil, queue: .main
+        ) { [weak self] _ in self?.settings.show(page: .home) }
         capture.onLevel = { [weak self] level in self?.panel.push(level: level) }
+        installMeetingObserver()
 
         // Accessibility is what lets us watch keys globally and press Cmd+V.
         let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
@@ -281,6 +378,9 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             installTap()
         }
         if checkModel(quiet: true) { startEngine() }
+        if CommandLine.arguments.contains("--meeting") || Meeting.consumePing() {
+            handleMeetingPing()
+        }
     }
 
     func applicationWillTerminate(_ note: Notification) {
@@ -288,6 +388,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         take = nil
         _ = capture.stop()
         server?.terminate()
+        restoreClipboard()
     }
 
     // MARK: Engine (FluidAudio in-process; whisper-server only if engine is whisper)
@@ -362,6 +463,10 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let flags = event.flags
         let key = event.getIntegerValueField(.keyboardEventKeycode)
 
+        if let field = store.hotkeyCapture {
+            return handleCapture(field: field, type: type, event: event, flags: flags, key: key)
+        }
+
         let chords: [(Hotkey, Mode)] = [(cleanupHK!, .cleanup), (recordHK!, .plain)]
         let escape: Int64 = 53
 
@@ -388,28 +493,49 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
             }
         case .recording:
-            // Tap the chord again to stop and paste. Esc closes the card on
-            // the spot, no confirmation: the take is still transcribed and
-            // saved to history and ~/Dictation, it just does not paste.
+            // Dictation: tap the record/cleanup chord again to stop and paste.
+            // Meeting: Option+Command+Space stops (not Option+Space). Esc
+            // closes the card; the take still transcribes.
             if type == .keyDown {
                 if event.getIntegerValueField(.keyboardEventAutorepeat) != 0 { return nil }
-                if key == escape { stopRecording(shouldPaste: false); return nil }
-                for (hk, _) in chords where hk.keyCode == key && hk.modifiersHeld(flags) {
-                    stopRecording(); return nil
+                if key == escape {
+                    if meetingActive { cancelMeeting() } else { stopRecording(shouldPaste: false) }
+                    return nil
+                }
+                if meetingActive {
+                    let mh = Meeting.stopHotkey
+                    if mh.keyCode == key && mh.modifiersHeld(flags) {
+                        stopRecording(); return nil
+                    }
+                    // Swallow dictation chords so Option+Space doesn't stop
+                    // a meeting or insert a non-breaking space underneath.
+                    for (hk, _) in chords where hk.keyCode == key && hk.modifiersHeld(flags) {
+                        return nil
+                    }
+                } else {
+                    for (hk, _) in chords where hk.keyCode == key && hk.modifiersHeld(flags) {
+                        stopRecording(); return nil
+                    }
                 }
             } else if type == .keyUp {
                 if key == escape { return nil }
+                if meetingActive, Meeting.stopHotkey.keyCode == key { return nil }
                 for (hk, _) in chords where hk.keyCode == key { return nil }
             } else if type == .flagsChanged {
+                if meetingActive { break }
                 for (hk, _) in chords where hk.keyCode == nil && hk.modifiersHeld(flags) {
                     stopRecording(); break
                 }
             }
         case .transcribing:
-            // Esc dismisses the card early; the transcription still finishes
-            // and pastes in the background.
+            // Dictation: Esc hides the card; the take still pastes.
+            // Meeting: Esc cancels — no transcript, no sticky.
             if type == .keyDown, key == escape {
-                DispatchQueue.main.async { self.panel.hide() }
+                if meetingActive {
+                    cancelMeeting()
+                } else {
+                    DispatchQueue.main.async { self.panel.hide() }
+                }
                 return nil
             }
             if type == .keyUp, key == escape { return nil }
@@ -417,10 +543,48 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return Unmanaged.passUnretained(event)
     }
 
+    /// Swallow the next chord into `recordHotkey` / `cleanupHotkey`. Esc with
+    /// no modifiers cancels. Letters without a modifier stay listening.
+    func handleCapture(field: AppStore.HotkeyCapture, type: CGEventType, event: CGEvent,
+                       flags: CGEventFlags, key: Int64) -> Unmanaged<CGEvent>? {
+        if type == .keyDown {
+            if event.getIntegerValueField(.keyboardEventAutorepeat) != 0 { return nil }
+            if key == 53, flags.intersection(Hotkey.modifierMask).isEmpty {
+                DispatchQueue.main.async { self.store.hotkeyCapture = nil }
+                return nil
+            }
+            if let s = Hotkey.string(flags: flags, keyCode: key) {
+                DispatchQueue.main.async {
+                    self.store.hotkeyCapture = nil
+                    let other = field == .record ? self.cfg.cleanupHotkey : self.cfg.recordHotkey
+                    guard s != other else { return }
+                    let keyName = field == .record ? "recordHotkey" : "cleanupHotkey"
+                    self.updateConfig([keyName: s])
+                }
+                return nil
+            }
+            return nil
+        }
+        if type == .keyUp { return nil }
+        return Unmanaged.passUnretained(event)
+    }
+
+    func beginHotkeyCapture(_ field: AppStore.HotkeyCapture) {
+        if store.hotkeyCapture == field { store.hotkeyCapture = nil; return }
+        store.hotkeyCapture = field
+    }
+
     // MARK: Recording
 
     func startRecording(_ mode: Mode) {
-        guard checkModel(quiet: false) else { return }
+        store.hotkeyCapture = nil
+        guard checkModel(quiet: false) else {
+            if meetingActive {
+                meetingActive = false
+                DispatchQueue.main.async { self.statusItem.isVisible = true }
+            }
+            return
+        }
         takeGen += 1
         let gen = takeGen
         take = StreamTake(gen: gen)
@@ -428,16 +592,23 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         capture.onChunk = { [weak self] chunk in
             self?.work.async { self?.ingest(chunk, gen: gen) }
         }
-        guard capture.start() else {
+        guard capture.start(deviceName: cfg.audioDevice) else {
             take = nil
             capture.onChunk = nil
+            if meetingActive {
+                meetingActive = false
+                DispatchQueue.main.async { self.statusItem.isVisible = true }
+            }
             alert("Couldn't open the microphone.")
             return
         }
         state = .recording(mode)
-        if cfg.sounds { NSSound(named: "Tink")?.play() }
+        playTakeSound(Config.soundName(cfg.startSound, fallback: "Tink"))
         DispatchQueue.main.async {
-            self.panel.show(mode: mode, hotkey: self.cfg.recordHotkey)
+            self.panel.show(mode: mode,
+                            hotkey: self.meetingActive ? Meeting.stopChord : self.cfg.recordHotkey,
+                            footer: self.meetingActive ? "Debrief" : nil,
+                            closeLabel: self.meetingActive ? "Cancel" : "Close")
         }
     }
 
@@ -446,16 +617,25 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func stopRecording(shouldPaste: Bool = true) {
         guard case .recording(let mode) = state else { return }
         state = .transcribing
-        if cfg.sounds { NSSound(named: "Pop")?.play() }
+        playTakeSound(Config.soundName(cfg.stopSound, fallback: "Pop"))
         let samples = capture.stop()
         let gen = take?.gen ?? takeGen
         let tStop = CFAbsoluteTimeGetCurrent()
         DispatchQueue.main.async {
-            if shouldPaste { self.panel.transcribing() } else { self.panel.hide() }
+            if self.meetingActive {
+                self.panel.transcribing(status: "Transcribing…")
+            } else if shouldPaste {
+                self.panel.transcribing()
+            } else {
+                self.panel.hide()
+            }
         }
 
+        let app = frontmostAppName()
+        let meetingGenAtStop = meetingGen
         work.async {
-            self.finishTake(samples: samples, mode: mode, gen: gen, tStop: tStop, shouldPaste: shouldPaste)
+            self.finishTake(samples: samples, mode: mode, gen: gen, tStop: tStop,
+                            shouldPaste: shouldPaste, app: app, meetingGen: meetingGenAtStop)
         }
     }
 
@@ -483,19 +663,29 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    func finishTake(samples: [Float], mode: Mode, gen: Int, tStop: CFAbsoluteTime, shouldPaste: Bool) {
+    func finishTake(samples: [Float], mode: Mode, gen: Int, tStop: CFAbsoluteTime, shouldPaste: Bool, app: String,
+                    meetingGen expectedMeetingGen: Int = 0) {
+        let inMeeting = meetingActive
         var pasted = false
         defer {
-            self.take = nil
-            self.state = .idle
-            if !pasted { DispatchQueue.main.async { self.panel.hide() } }
+            if !inMeeting {
+                self.take = nil
+                self.state = .idle
+                if !pasted { DispatchQueue.main.async { self.panel.hide() } }
+            }
         }
-        guard take?.gen == gen else { return }
+        guard take?.gen == gen else {
+            if inMeeting { endMeetingSession() }
+            return
+        }
 
         let overlapped = take?.decodeMs ?? 0
         let liveOk = take?.unhealthy == false && !(take?.texts.isEmpty ?? true)
         let seconds = Double(samples.count) / Capture.sampleRate
-        guard seconds >= cfg.minSeconds else { return }
+        guard seconds >= cfg.minSeconds else {
+            if inMeeting { endMeetingSession() }
+            return
+        }
 
         var fallback = false
         var text: String
@@ -526,6 +716,13 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         let tAsr = CFAbsoluteTimeGetCurrent()
+        if inMeeting {
+            guard meetingActive, meetingGen == expectedMeetingGen else { return }
+            finishMeeting(samples: samples, text: text, seconds: seconds, expectedGen: expectedMeetingGen)
+            NSLog("Whisper meeting: %.1fs audio, overlapped=%.0fms asr=%.0fms fallback=%d",
+                  seconds, overlapped, (tAsr - tStop) * 1000, fallback ? 1 : 0)
+            return
+        }
         guard !text.isEmpty else {
             if cfg.sounds { DispatchQueue.main.async { NSSound(named: "Basso")?.play() } }
             NSLog("Whisper: %.1fs audio, overlapped=%.0fms asr=%.0fms empty fallback=%d",
@@ -537,13 +734,17 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         text = Config.applyReplacements(replacements, to: text)
 
         pasted = true
+        let now = Date()
+        let shown = History.flatten(text)
+        log(shown, at: now)
+        let entry = Stats.Take(date: now, words: Stats.wordCount(shown), seconds: seconds, app: app)
+        Stats.append(entry, in: App.dictationDir)
         DispatchQueue.main.async {
-            self.history.insert(Transcript(date: Date(), text: text), at: 0)
-            if self.history.count > 10 { self.history.removeLast(self.history.count - 10) }
+            self.history.insert(Transcript(date: now, text: shown), at: 0)
+            self.store.stats.insert(entry, at: 0)
             self.panel.hide()
         }
         if shouldPaste { paste(text) }
-        log(text)
         NSLog("Whisper: %.1fs audio, overlapped=%.0fms asr=%.0fms paste=%.0fms segments=%d fallback=%d",
               seconds, overlapped, (tAsr - tStop) * 1000,
               (CFAbsoluteTimeGetCurrent() - tAsr) * 1000,
@@ -711,13 +912,20 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: Paste + clipboard restore
 
+    /// Snapshot, write the take, post ⌘V, return. Restore runs 350ms later on
+    /// main, not on `whisper.work`, so a two-word take is not stuck behind sleep.
     func paste(_ text: String) {
+        DispatchQueue.main.async { self.pasteOnMain(text) }
+    }
+
+    private func pasteOnMain(_ text: String) {
         let pb = NSPasteboard.general
-        // Snapshot everything on the clipboard (all items, all flavors).
-        let saved: [[NSPasteboard.PasteboardType: Data]] = (pb.pasteboardItems ?? []).map { item in
-            var d: [NSPasteboard.PasteboardType: Data] = [:]
-            for t in item.types { if let data = item.data(forType: t) { d[t] = data } }
-            return d
+        if savedClipboard == nil {
+            savedClipboard = (pb.pasteboardItems ?? []).map { item in
+                var d: [NSPasteboard.PasteboardType: Data] = [:]
+                for t in item.types { if let data = item.data(forType: t) { d[t] = data } }
+                return d
+            }
         }
 
         pb.clearContents()
@@ -730,8 +938,18 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         down?.post(tap: .cghidEventTap)
         up?.post(tap: .cghidEventTap)
 
-        // Give the target app a moment to read the clipboard before we put the old stuff back.
-        Thread.sleep(forTimeInterval: 0.35)
+        clipboardRestore?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.restoreClipboard() }
+        clipboardRestore = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: work)
+    }
+
+    func restoreClipboard() {
+        clipboardRestore?.cancel()
+        clipboardRestore = nil
+        guard let saved = savedClipboard else { return }
+        savedClipboard = nil
+        let pb = NSPasteboard.general
         pb.clearContents()
         if !saved.isEmpty {
             let items: [NSPasteboardItem] = saved.map { d in
@@ -745,31 +963,32 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: Log + history
 
-    static let monthFmt: DateFormatter = { let f = DateFormatter(); f.dateFormat = "yyyy-MM"; return f }()
-    static let stampFmt: DateFormatter = { let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd HH:mm"; return f }()
-
-    func log(_ text: String) {
-        let now = Date()
-        let file = App.dictationDir.appendingPathComponent("\(App.monthFmt.string(from: now)).md")
-        let line = "- **\(App.stampFmt.string(from: now))** \(text)\n"
+    func log(_ text: String, at now: Date) {
+        let file = History.monthFile(for: now, in: App.dictationDir)
+        let line = History.line(date: now, text: text)
         if let h = try? FileHandle(forWritingTo: file) {
             h.seekToEndOfFile(); h.write(line.data(using: .utf8)!); try? h.close()
         } else {
-            try? ("# Dictation \(App.monthFmt.string(from: now))\n\n" + line).write(to: file, atomically: true, encoding: .utf8)
+            try? ("# Dictation \(file.deletingPathExtension().lastPathComponent)\n\n" + line)
+                .write(to: file, atomically: true, encoding: .utf8)
         }
         try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
     }
 
+    /// Every take from every month file, newest first (History.swift).
     func loadHistory() {
-        let file = App.dictationDir.appendingPathComponent("\(App.monthFmt.string(from: Date())).md")
-        guard let text = try? String(contentsOf: file, encoding: .utf8) else { return }
-        let entries = text.split(separator: "\n").compactMap { line -> Transcript? in
-            guard line.hasPrefix("- **"), let close = line.range(of: "** ") else { return nil }
-            let stamp = String(line[line.index(line.startIndex, offsetBy: 4)..<close.lowerBound])
-            guard let d = App.stampFmt.date(from: stamp) else { return nil }
-            return Transcript(date: d, text: String(line[close.upperBound...]))
+        history = History.load(dir: App.dictationDir)
+        store.stats = Stats.load(dir: App.dictationDir)
+    }
+
+    /// App the take was aimed at. Settings can steal frontmost; fall back to
+    /// whoever was in front when the window opened.
+    func frontmostAppName() -> String {
+        let me = ProcessInfo.processInfo.processIdentifier
+        if let app = NSWorkspace.shared.frontmostApplication, app.processIdentifier != me {
+            return app.localizedName ?? app.bundleIdentifier ?? ""
         }
-        history = Array(entries.suffix(10).reversed())
+        return settings.recordedAppName()
     }
 
     // MARK: Menu
@@ -811,56 +1030,273 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         b.toolTip = tip
     }
 
+    /// Superwhisper-shaped dropdown: actions, then mic + mode pickers, then
+    /// version and Quit. Transcripts live in the History window now.
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
-        let status: String
+        let toggleTitle: String
         switch state {
-        case .idle: status = "Idle · press \(cfg.recordHotkey)"
-        case .recording(let m): status = m == .cleanup ? "Recording (cleanup mode)…" : "Recording…"
-        case .transcribing: status = "Transcribing…"
+        case .idle: toggleTitle = "Toggle Recording"
+        case .recording: toggleTitle = "Stop Recording"
+        case .transcribing: toggleTitle = "Transcribing…"
         }
-        menu.addItem(withTitle: status, action: nil, keyEquivalent: "")
+        let toggle = menu.addItem(withTitle: toggleTitle, action: #selector(toggleRecording), keyEquivalent: "")
+        toggle.target = self
+        if case .transcribing = state { toggle.isEnabled = false }
+        menu.addItem(withTitle: "History…", action: #selector(openHistory), keyEquivalent: "").target = self
+        menu.addItem(withTitle: "Settings…", action: #selector(openSettings), keyEquivalent: ",").target = self
         menu.addItem(.separator())
 
-        if history.isEmpty {
-            menu.addItem(withTitle: "No transcripts yet", action: nil, keyEquivalent: "")
-        } else {
-            let tf = DateFormatter(); tf.dateFormat = "h:mm a"
-            for (i, t) in history.enumerated() {
-                var preview = t.text.replacingOccurrences(of: "\n", with: " ")
-                if preview.count > 70 { preview = String(preview.prefix(70)) + "…" }
-                let it = NSMenuItem(title: "\(tf.string(from: t.date))  \(preview)",
-                                    action: #selector(copyTranscript(_:)), keyEquivalent: "")
-                it.target = self; it.tag = i
-                it.image = NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: "Copy")
-                it.toolTip = "Click to copy:\n\(t.text)"
-                menu.addItem(it)
+        // Microphone ▸ System default + every input, check on the one config.json names.
+        let (micName, micSymbol) = micDisplay()
+        let micItem = NSMenuItem(title: micName, action: nil, keyEquivalent: "")
+        micItem.image = NSImage(systemSymbolName: micSymbol, accessibilityDescription: nil)
+        let micMenu = NSMenu()
+        let chosen = Capture.device(named: cfg.audioDevice)
+        let def = NSMenuItem(title: "System default", action: #selector(pickMic(_:)), keyEquivalent: "")
+        def.target = self; def.representedObject = ""; def.state = chosen == nil ? .on : .off
+        micMenu.addItem(def)
+        micMenu.addItem(.separator())
+        for d in Capture.inputDevices() {
+            let it = NSMenuItem(title: d.localizedName, action: #selector(pickMic(_:)), keyEquivalent: "")
+            it.target = self
+            it.representedObject = d.localizedName
+            it.state = d.uniqueID == chosen?.uniqueID ? .on : .off
+            micMenu.addItem(it)
+        }
+        micItem.submenu = micMenu
+        menu.addItem(micItem)
+
+        // Mode ▸ Plain / Cleanup, for the menu's Toggle Recording.
+        let modeItem = NSMenuItem(title: menuMode == .cleanup ? "Cleanup" : "Plain", action: nil, keyEquivalent: "")
+        modeItem.image = NSImage(systemSymbolName: "text.bubble.fill", accessibilityDescription: nil)
+        let modeMenu = NSMenu()
+        for (title, mode) in [("Plain", Mode.plain), ("Cleanup", Mode.cleanup)] {
+            let it = NSMenuItem(title: title, action: #selector(pickMode(_:)), keyEquivalent: "")
+            it.target = self
+            it.representedObject = mode == .cleanup ? "cleanup" : "plain"
+            it.state = mode == menuMode ? .on : .off
+            modeMenu.addItem(it)
+        }
+        modeItem.submenu = modeMenu
+        menu.addItem(modeItem)
+        menu.addItem(.separator())
+
+        menu.addItem(withTitle: "Version \(App.version)", action: nil, keyEquivalent: "").isEnabled = false
+        menu.addItem(withTitle: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+    }
+
+    /// The one place that decides what the mic row and the window toolbar
+    /// say: the chosen device's name, or "System default" + whatever macOS
+    /// would use, with a laptop glyph for the built-in mic and a mic glyph otherwise.
+    func micDisplay() -> (name: String, symbol: String) {
+        let chosen = Capture.device(named: cfg.audioDevice)
+        let shown = chosen ?? AVCaptureDevice.default(for: .audio)
+        let builtIn = shown.map { $0.deviceType == .microphone && $0.localizedName.lowercased().contains("macbook") } ?? true
+        return (chosen?.localizedName ?? "System default", builtIn ? "laptopcomputer" : "mic")
+    }
+
+    /// Minimal main menu. The bar is never visible for a menu bar app, but
+    /// AppKit routes ⌘, ⌘W ⌘Q and the Edit key equivalents (⌘C/V/A/Z in any
+    /// text field) through it, so without one none of them work in the window.
+    func installMainMenu() {
+        let main = NSMenu()
+        let appMenu = NSMenu()
+        appMenu.addItem(withTitle: "Settings…", action: #selector(openSettings), keyEquivalent: ",").target = self
+        appMenu.addItem(.separator())
+        appMenu.addItem(withTitle: "Quit Whisper", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        let appItem = NSMenuItem(); appItem.submenu = appMenu; main.addItem(appItem)
+
+        let file = NSMenu(title: "File")
+        file.addItem(withTitle: "Close", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        let fileItem = NSMenuItem(); fileItem.submenu = file; main.addItem(fileItem)
+
+        let edit = NSMenu(title: "Edit")
+        edit.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
+        edit.addItem(withTitle: "Redo", action: Selector(("redo:")), keyEquivalent: "Z")
+        edit.addItem(.separator())
+        edit.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        edit.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        edit.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        edit.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        let editItem = NSMenuItem(); editItem.submenu = edit; main.addItem(editItem)
+        NSApp.mainMenu = main
+    }
+
+    @objc func toggleRecording() {
+        switch state {
+        case .idle: startRecording(menuMode)
+        case .recording: stopRecording()
+        case .transcribing: break
+        }
+    }
+    @objc func openHistory() { settings.show(page: .history) }
+    @objc func openSettings() { settings.show(page: .home) }
+
+    @objc func pickMic(_ sender: NSMenuItem) {
+        guard let name = sender.representedObject as? String else { return }
+        updateConfig(["audioDevice": name])
+    }
+
+    /// Write a few keys, re-read the file, refresh what depends on it. Only
+    /// engine-related keys restart the engine; a mic or hotkey change must
+    /// not kill whisper-server or block the main thread on pkill.
+    func updateConfig(_ patch: [String: Any]) {
+        Config.save(patch: patch, current: cfg)
+        cfg = Config.load()
+        replacements = Config.loadReplacements()
+        if let r = Hotkey.parse(cfg.recordHotkey) { recordHK = r }
+        if let c = Hotkey.parse(cfg.cleanupHotkey) { cleanupHK = c }
+        refreshIcon()
+        syncStore()
+        let engineKeys: Set<String> = ["engine", "modelPath", "parakeetModel", "serverPort", "threads", "language", "whisperPath"]
+        if !engineKeys.isDisjoint(with: patch.keys), checkModel(quiet: true) { startEngine() }
+    }
+    @objc func pickMode(_ sender: NSMenuItem) {
+        menuMode = (sender.representedObject as? String) == "cleanup" ? .cleanup : .plain
+    }
+
+    /// Push the config-derived bits the window shows. (`history` and `state`
+    /// reach the store from their own didSets.)
+    func syncStore() {
+        let (name, symbol) = micDisplay()
+        store.micName = name
+        store.micSymbol = symbol
+        store.recordHotkey = cfg.recordHotkey
+        store.cleanupHotkey = cfg.cleanupHotkey
+        store.audioDevice = cfg.audioDevice
+        store.language = cfg.language
+        store.minSeconds = cfg.minSeconds
+        if store.cleanupPrompt != cfg.cleanupPrompt { store.cleanupPrompt = cfg.cleanupPrompt }
+        store.sounds = cfg.sounds
+        store.startSound = Config.soundName(cfg.startSound, fallback: "Tink")
+        store.stopSound = Config.soundName(cfg.stopSound, fallback: "Pop")
+        store.engineName = cfg.engineName
+        store.modelMissing = cfg.engineName == "whisper" && !FileManager.default.fileExists(atPath: cfg.modelPath)
+    }
+
+    /// Mic list, login-item state, replacements. Cheap; called when the
+    /// window becomes key so an external edit of replacements.txt is picked up.
+    func refreshUIState() {
+        replacements = Config.loadReplacements()
+        store.mics = Capture.inputDevices().map(\.localizedName)
+        store.launchAtLogin = loginItemLoaded()
+        syncStore()
+    }
+
+    func playTakeSound(_ name: String) {
+        guard cfg.sounds, !name.isEmpty else { return }
+        NSSound(named: NSSound.Name(name))?.play()
+    }
+
+    /// Preview from the Sound page. Works even when Sounds is off, so you
+    /// can hear a pick before turning them on. Stops the previous preview.
+    func previewSound(_ name: String) {
+        preview?.stop()
+        preview = nil
+        let n = name.trimmingCharacters(in: .whitespaces)
+        guard !n.isEmpty, n.lowercased() != "none" else { return }
+        if let s = NSSound(named: NSSound.Name(n)) {
+            preview = s
+            s.play()
+            return
+        }
+        let url = URL(fileURLWithPath: "/System/Library/Sounds/\(n).aiff")
+        preview = NSSound(contentsOf: url, byReference: true)
+        preview?.play()
+    }
+
+    func openItem(_ id: String) {
+        switch id {
+        case "replacements":
+            Config.writeTemplates()
+            NSWorkspace.shared.open(Config.replacementsFile)
+        case "env":
+            if !FileManager.default.fileExists(atPath: Config.envFile.path) {
+                let starter = """
+                # Local Ollama, or xAI Grok. Leave blank to skip cleanup.
+                # OLLAMA_MODEL=
+                # OLLAMA_URL=http://127.0.0.1:11434/api/chat
+                # XAI_API_KEY=
+                # LLM_MODEL=grok-4-fast-non-reasoning
+
+                """
+                try? starter.write(to: Config.envFile, atomically: true, encoding: .utf8)
             }
+            NSWorkspace.shared.open(Config.envFile)
+        case "configDir":
+            NSWorkspace.shared.open(Config.dir)
+        case "dictation":
+            NSWorkspace.shared.open(App.dictationDir)
+        default: break
         }
-        menu.addItem(.separator())
-        menu.addItem(withTitle: "Open Dictation Folder", action: #selector(openDictation), keyEquivalent: "").target = self
-        menu.addItem(withTitle: "Open Config Folder", action: #selector(openConfig), keyEquivalent: "").target = self
-        menu.addItem(withTitle: "Reload Config", action: #selector(reloadConfig), keyEquivalent: "").target = self
-        if !FileManager.default.fileExists(atPath: cfg.modelPath) {
-            menu.addItem(withTitle: "Download base.en Model (~150 MB)", action: #selector(downloadModel), keyEquivalent: "").target = self
-        }
-        menu.addItem(.separator())
-        menu.addItem(withTitle: "Quit Whisper", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
     }
 
-    @objc func copyTranscript(_ sender: NSMenuItem) {
-        guard history.indices.contains(sender.tag) else { return }
-        let pb = NSPasteboard.general
-        pb.clearContents(); pb.setString(history[sender.tag].text, forType: .string)
+    static let loginLabel = "com.maxoleary.whisper"
+    static var loginPlist: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/LaunchAgents/\(loginLabel).plist")
     }
-    @objc func openDictation() { NSWorkspace.shared.open(App.dictationDir) }
-    @objc func openConfig() { NSWorkspace.shared.open(Config.dir) }
+    var loginTarget: String { "gui/\(getuid())/\(App.loginLabel)" }
+    var loginDomain: String { "gui/\(getuid())" }
+
+    func loginItemLoaded() -> Bool {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        p.arguments = ["print", loginTarget]
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        do { try p.run() } catch { return false }
+        p.waitUntilExit()
+        return p.terminationStatus == 0
+    }
+
+    func setLaunchAtLogin(_ on: Bool) {
+        if on {
+            writeLoginPlist()
+            if !loginItemLoaded() {
+                _ = run("/bin/launchctl", ["bootstrap", loginDomain, App.loginPlist.path])
+            }
+        } else {
+            if loginItemLoaded() {
+                _ = run("/bin/launchctl", ["bootout", loginTarget])
+            }
+            try? FileManager.default.removeItem(at: App.loginPlist)
+        }
+        store.launchAtLogin = loginItemLoaded()
+    }
+
+    func writeLoginPlist() {
+        let url = App.loginPlist
+        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
+                                                 withIntermediateDirectories: true)
+        let xml = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0">
+        <dict>
+            <key>Label</key>            <string>\(App.loginLabel)</string>
+            <key>ProgramArguments</key>
+            <array>
+                <string>/usr/bin/open</string>
+                <string>-a</string>
+                <string>/Applications/Whisper.app</string>
+            </array>
+            <key>RunAtLoad</key>        <true/>
+            <key>ProcessType</key>      <string>Interactive</string>
+        </dict>
+        </plist>
+        """
+        try? xml.write(to: url, atomically: true, encoding: .utf8)
+    }
+
     @objc func reloadConfig() {
         cfg = Config.load()
         replacements = Config.loadReplacements()
         if let r = Hotkey.parse(cfg.recordHotkey) { recordHK = r }
         if let c = Hotkey.parse(cfg.cleanupHotkey) { cleanupHK = c }
         refreshIcon()
+        syncStore()
         if checkModel(quiet: true) { startEngine() }
     }
 
@@ -895,12 +1331,12 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 try? FileManager.default.removeItem(atPath: dest)
                 try? FileManager.default.moveItem(atPath: dest + ".part", toPath: dest)
                 self.notify("Model ready", "\(name) downloaded. Press \(self.cfg.recordHotkey) to dictate.")
-                DispatchQueue.main.async { self.startEngine() }
+                DispatchQueue.main.async { self.startEngine(); self.syncStore() }
             } else {
                 try? FileManager.default.removeItem(atPath: dest + ".part")
                 self.alert("Model download failed (curl exit \(code)).\n\(err.suffix(300))")
             }
-            self.state = .idle
+            DispatchQueue.main.async { self.state = .idle; self.syncStore() }
         }
     }
 
@@ -930,6 +1366,18 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let esc = { (s: String) in s.replacingOccurrences(of: "\"", with: "\\\"") }
         _ = run("/usr/bin/osascript", ["-e", "display notification \"\(esc(body))\" with title \"\(esc(title))\""])
     }
+}
+
+if CommandLine.arguments.contains("--transcribe") || CommandLine.arguments.contains("--ensure") {
+    TranscribeCLI.run()
+    exit(0)
+}
+
+if !Meeting.tryBecomePrimary() {
+    if CommandLine.arguments.contains("--meeting") {
+        Meeting.notifyPrimary()
+    }
+    exit(0)
 }
 
 let app = NSApplication.shared

@@ -16,12 +16,11 @@ back the way it was.
 
 | Press | What happens |
 |---|---|
-| `⌘ ⌥ Space` | Start recording. Press again to stop and paste. |
+| `⌥ Space` | Start recording. Press again to stop and paste. |
 | `⌘ ⌥ ⇧ Space` | Same, but an LLM tidies punctuation and filler words first. |
 | `Esc` while recording | Closes the card right away and skips the paste. The take is still transcribed and saved to history and `~/Dictation`. |
 
-Change the keys in `~/.config/whisper/config.json`, then pick
-**Reload Config** from the menu bar icon.
+Change the keys in Settings → Configuration, or in `~/.config/whisper/config.json`.
 
 ## Install
 
@@ -49,18 +48,21 @@ terminal instead.
 | Thing | Where |
 |---|---|
 | Transcripts | `~/Dictation/YYYY-MM.md`, one line per take |
+| Per-take stats | `~/Dictation/stats.jsonl` (`ts`, words, audio seconds, app) |
 | Settings | `~/.config/whisper/config.json` |
 | Cleanup-mode LLM | `~/.config/whisper/.env` - local Ollama or xAI Grok |
 | Vocabulary | `~/.config/whisper/vocabulary.txt` - words Parakeet should favor (off by default) |
 | Replacements | `~/.config/whisper/replacements.txt` - `heard -> wanted`, whole words |
 
-Replacements take effect after **Reload Config**. They are plain find-and-replace,
+Replacements take effect the next time the Settings window is focused. They are plain find-and-replace,
 case-insensitive on the left, exact on the right, so `vortex cfd -> VortexCFD`
 does not need an LLM. `vocabulary.txt` is unused for now.
 
-The menu bar icon keeps your last 10 takes - click one to copy it.
+**History…** in the menu bar opens the history window. The dropdown also picks the microphone and the mode used by **Toggle Recording**.
 
 ## Start at login
+
+Settings → Configuration has a Launch at login toggle. Same thing by hand:
 
 ```sh
 cp com.maxoleary.whisper.plist ~/Library/LaunchAgents/

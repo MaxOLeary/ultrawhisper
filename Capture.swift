@@ -15,7 +15,9 @@ final class Capture {
     private let lock = NSLock()
     private var live = false
 
-    func start() -> Bool {
+    /// `deviceName` is the mic's localizedName from config.json; empty, "0", or
+    /// an unknown name means the system default input.
+    func start(deviceName: String = "") -> Bool {
         lock.lock()
         samples.removeAll(keepingCapacity: true)
         samples.reserveCapacity(Int(Capture.sampleRate * 30))
@@ -24,6 +26,12 @@ final class Capture {
 
         let e = AVAudioEngine()
         let input = e.inputNode
+        if let id = Capture.deviceID(named: deviceName), let unit = input.audioUnit {
+            var dev = id
+            let st = AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0,
+                                          &dev, UInt32(MemoryLayout<AudioDeviceID>.size))
+            if st != noErr { NSLog("Whisper capture: could not select \"\(deviceName)\" (\(st)); using default") }
+        }
         let hw = input.outputFormat(forBus: 0)
         guard hw.channelCount > 0, hw.sampleRate > 0,
               let dst = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: Capture.sampleRate,
@@ -69,6 +77,39 @@ final class Capture {
             converter = nil
             return false
         }
+    }
+
+    /// Every audio input macOS knows about, in system order.
+    static func inputDevices() -> [AVCaptureDevice] {
+        AVCaptureDevice.DiscoverySession(deviceTypes: [.microphone, .external],
+                                         mediaType: .audio, position: .unspecified).devices
+    }
+
+    /// The input config.json names, or nil for "use the system default".
+    /// Owns the one matching rule: trimmed, exact localizedName; "" and the
+    /// legacy "0" mean default.
+    static func device(named name: String) -> AVCaptureDevice? {
+        let wanted = name.trimmingCharacters(in: .whitespaces)
+        guard !wanted.isEmpty, wanted != "0" else { return nil }
+        let dev = inputDevices().first { $0.localizedName == wanted }
+        if dev == nil { NSLog("Whisper capture: no input named \"\(wanted)\"; using the system default") }
+        return dev
+    }
+
+    /// CoreAudio id for the input whose name matches, or nil for "use the default".
+    static func deviceID(named name: String) -> AudioDeviceID? {
+        guard let dev = device(named: name) else { return nil }
+        var uid = dev.uniqueID as CFString
+        var id = AudioDeviceID(0)
+        var addr = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyTranslateUIDToDevice,
+                                              mScope: kAudioObjectPropertyScopeGlobal,
+                                              mElement: kAudioObjectPropertyElementMain)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        let st = withUnsafeMutablePointer(to: &uid) { uidPtr in
+            AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr,
+                                       UInt32(MemoryLayout<CFString>.size), uidPtr, &size, &id)
+        }
+        return st == noErr && id != 0 ? id : nil
     }
 
     @discardableResult

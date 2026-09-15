@@ -36,7 +36,7 @@ final class ParakeetEngine: @unchecked Sendable {
     }
 
     /// Empty string on not-ready, too-short audio, or a thrown decode.
-    func transcribe(_ samples: [Float]) -> String {
+    func transcribe(_ samples: [Float], timeout: TimeInterval = 30) -> String {
         guard isReady else { return "" }
         // FluidAudio rejects takes under ~300 ms.
         guard samples.count >= Int(0.3 * Capture.sampleRate) else { return "" }
@@ -52,7 +52,7 @@ final class ParakeetEngine: @unchecked Sendable {
                 NSLog("Whisper: FluidAudio \(error)")
             }
         }
-        _ = sem.wait(timeout: .now() + 30)
+        _ = sem.wait(timeout: .now() + timeout)
         return box.text
     }
 
