@@ -13,6 +13,7 @@ enum TranscribeCLI {
         let ensureOnly = CommandLine.arguments.contains("--ensure")
             && !CommandLine.arguments.contains("--transcribe")
         let engine = ParakeetEngine()
+        engine.latinOnly = ParakeetEngine.usesLatinScript(Config.load().language)
         engine.start()
         let deadline = Date().addingTimeInterval(120)
         while !engine.isReady && Date() < deadline {

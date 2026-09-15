@@ -12,9 +12,11 @@ REPO="MaxOLeary/whisper"
 SHIP=0
 [ "${1:-}" = "--ship" ] && SHIP=1
 
-# Drop only this target's objects: incremental release builds have linked
-# stale .o files more than once. FluidAudio's objects stay cached.
-rm -rf .build/arm64-apple-macosx/release/Whisper.build
+# Drop only this target's object files: incremental release builds have linked
+# stale .o files more than once. Removing the whole Whisper.build folder breaks
+# SwiftPM (it loses output-file-map.json), so delete just the .o files.
+# FluidAudio's objects stay cached.
+find .build/arm64-apple-macosx/release/Whisper.build -name '*.o' -delete 2>/dev/null || true
 
 swift build -c release --product Whisper --arch arm64
 REL="$(swift build -c release --arch arm64 --show-bin-path)"
@@ -95,6 +97,8 @@ install_app() {
     codesign --verify --deep --strict "/Applications/$APP"
     echo "codesign verify: OK"
     codesign -dv --verbose=2 "/Applications/$APP" 2>&1 | grep -E '^Authority=|flags=' || true
+    # Always `open -a`: exec'ing the binary breaks the menu bar icon for the session.
+    open -a "/Applications/$APP"
 }
 install_app "$STAGE/$APP"
 

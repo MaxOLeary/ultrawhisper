@@ -402,6 +402,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         server?.terminate(); server = nil
         _ = run("/usr/bin/pkill", ["-f", "whisper-server.*--port \(cfg.serverPort)"])
         if cfg.engineName == "parakeet" {
+            parakeet.latinOnly = ParakeetEngine.usesLatinScript(cfg.language)
             parakeet.start()
             return
         }
@@ -1161,6 +1162,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Config.save(patch: patch, current: cfg)
         cfg = Config.load()
         replacements = Config.loadReplacements()
+        parakeet.latinOnly = ParakeetEngine.usesLatinScript(cfg.language)
         if let r = Hotkey.parse(cfg.recordHotkey) { recordHK = r }
         if let c = Hotkey.parse(cfg.cleanupHotkey) { cleanupHK = c }
         refreshIcon()
