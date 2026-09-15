@@ -75,10 +75,15 @@ Only add these sections if there is something real to put in them. Leave them ou
 
     // MARK: Notes dir / archive names (same shape as Debrief note.js)
 
-    static func notesDir() -> URL {
+    /// `meetingNotesDir` from config.json. If unset, Debrief's old `.env`
+    /// NOTES_DIR is read once and persisted so the fallback never runs again.
+    static func notesDir(cfg: Config) -> URL {
+        if let raw = cfg.meetingNotesDir, !raw.isEmpty { return expandHome(raw) }
         let home = FileManager.default.homeDirectoryForCurrentUser
         let envFile = home.appendingPathComponent(".config/debrief/.env")
         if let raw = envValue("NOTES_DIR", file: envFile) {
+            Config.save(patch: ["meetingNotesDir": raw], current: cfg)
+            NSLog("Whisper meeting: notes dir \(raw) taken from Debrief's .env and saved to config.json")
             return expandHome(raw)
         }
         return home.appendingPathComponent("Debrief")
@@ -172,29 +177,19 @@ Only add these sections if there is something real to put in them. Leave them ou
         return front + body.joined(separator: "\n")
     }
 
-    // MARK: Llama 3.2 3B (reuse Debrief’s install; do not download)
+    // MARK: Llama 3.2 3B (LocalLLM downloads it, or reuses ~/.config/debrief)
 
-    static var llamaDir: URL {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".config/debrief/llama")
-    }
-    static var llamaServer: URL { llamaDir.appendingPathComponent("llama-server") }
-    static var gguf: URL {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".config/debrief/models/Llama-3.2-3B-Instruct-Q4_K_M.gguf")
-    }
+    static var llamaDir: URL { LocalLLM.llamaDir() }
+    static var llamaServer: URL { LocalLLM.llamaServer() }
+    static var gguf: URL { LocalLLM.gguf() }
 
     /// `.text` is the markdown body; `.failed` is a one-line error for the note.
     enum Summary { case text(String); case failed(String) }
 
     static func summarize(_ transcript: String, when: Date, seconds: Double,
                           onStatus: ((String) -> Void)? = nil) -> Summary {
-        let fm = FileManager.default
-        guard fm.fileExists(atPath: llamaServer.path) else {
-            return .failed("llama-server is not installed at \(llamaServer.path)")
-        }
-        guard fm.fileExists(atPath: gguf.path) else {
-            return .failed("Llama 3.2 3B GGUF is missing")
+        if case .failed(let msg) = LocalLLM.ensure(onStatus: onStatus) {
+            return .failed(msg)
         }
         let port = pickPort()
         let p = Process()
@@ -449,7 +444,7 @@ extension App {
         }
         guard meetingGen == expectedGen else { return }
 
-        let dir = Meeting.notesDir()
+        let dir = Meeting.notesDir(cfg: cfg)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let slot = Meeting.slot(in: dir, when: when)
 

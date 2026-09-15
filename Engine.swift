@@ -8,8 +8,12 @@ final class ParakeetEngine: @unchecked Sendable {
     private let asr = AsrManager(config: .default)
     private let ready = OSAllocatedUnfairLock(initialState: false)
     private let loading = OSAllocatedUnfairLock(initialState: false)
+    /// What the first run is doing ("Downloading speech model (first run)…"),
+    /// or the load error. Empty once ready. Shown in the menu and card footer.
+    private let statusText = OSAllocatedUnfairLock(initialState: "")
 
     var isReady: Bool { ready.withLock { $0 } }
+    var status: String { statusText.withLock { $0 } }
 
     func start() {
         let skip = loading.withLock { flag -> Bool in
@@ -24,12 +28,16 @@ final class ParakeetEngine: @unchecked Sendable {
     private func load() async {
         do {
             NSLog("Whisper: loading FluidAudio Parakeet TDT v3")
+            statusText.withLock { $0 = "Downloading speech model (first run)…" }
             let models = try await AsrModels.downloadAndLoad(version: .v3)
+            statusText.withLock { $0 = "Loading speech model…" }
             try await asr.loadModels(models)
             ready.withLock { $0 = true }
+            statusText.withLock { $0 = "" }
             NSLog("Whisper: FluidAudio ready")
         } catch {
             ready.withLock { $0 = false }
+            statusText.withLock { $0 = "Speech model failed to load: \(error.localizedDescription)" }
             NSLog("Whisper: FluidAudio load failed: \(error)")
         }
         loading.withLock { $0 = false }

@@ -4,6 +4,7 @@ set -e
 cd "$(dirname "$0")"
 
 APP="Whisper.app"
+VERSION="$(cat VERSION)"
 BIN="$APP/Contents/MacOS/Whisper"
 
 swift build -c release --product Whisper --arch arm64
@@ -16,7 +17,7 @@ cp "$REL/Whisper" "$BIN"
 mkdir -p "$APP/Contents/Resources"
 cp icon/Whisper.icns "$APP/Contents/Resources/"
 
-cat > "$APP/Contents/Info.plist" <<'PLIST'
+cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -24,8 +25,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundleName</key>            <string>Whisper</string>
     <key>CFBundleDisplayName</key>     <string>Whisper</string>
     <key>CFBundleIdentifier</key>      <string>com.maxoleary.whisper</string>
-    <key>CFBundleVersion</key>         <string>1.0</string>
-    <key>CFBundleShortVersionString</key><string>1.0</string>
+    <key>CFBundleVersion</key>         <string>${VERSION}</string>
+    <key>CFBundleShortVersionString</key><string>${VERSION}</string>
     <key>CFBundlePackageType</key>     <string>APPL</string>
     <key>CFBundleExecutable</key>      <string>Whisper</string>
     <key>LSMinimumSystemVersion</key>  <string>14.0</string>

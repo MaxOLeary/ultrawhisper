@@ -35,6 +35,7 @@ struct Config: Codable {
     var engine: String?          // "parakeet" (default) or "whisper"
     var parakeetModel: String?   // folder under models/; nil = best installed build
     var hotwordsScore: Double?   // set (e.g. 1) to turn on vocabulary.txt hotwords; nil = off
+    var meetingNotesDir: String? // Meeting notes folder; nil = ~/Debrief
 
     static let dir = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".config/whisper", isDirectory: true)
@@ -604,11 +605,14 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         state = .recording(mode)
         playTakeSound(Config.soundName(cfg.startSound, fallback: "Tink"))
+        let engineStatus = cfg.engineName == "parakeet" ? parakeet.status : ""
         DispatchQueue.main.async {
             self.panel.show(mode: mode,
                             hotkey: self.meetingActive ? Meeting.stopChord : self.cfg.recordHotkey,
                             footer: self.meetingActive ? "Debrief" : nil,
                             closeLabel: self.meetingActive ? "Cancel" : "Close")
+            // Engine still downloading or loading: show that in the footer.
+            if !engineStatus.isEmpty { self.panel.setFooterLeft(engineStatus) }
         }
     }
 
@@ -759,6 +763,12 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Live segments skip the retry so a miss just marks the take unhealthy
         // and the full buffer runs once at stop.
         if cfg.engineName == "parakeet" {
+            if waitForServer && !parakeet.isReady {
+                let engineStatus = parakeet.status
+                if !engineStatus.isEmpty {
+                    DispatchQueue.main.async { self.panel.setFooterLeft(engineStatus) }
+                }
+            }
             let waits: [TimeInterval] = waitForServer ? [0, 0.4, 0.8, 1.6, 3.2] : [0]
             for wait in waits {
                 if wait > 0 { Thread.sleep(forTimeInterval: wait) }
@@ -1034,6 +1044,12 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// version and Quit. Transcripts live in the History window now.
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
+        // First run: Parakeet is downloading or compiling. Say so up top.
+        let engineStatus = parakeet.status
+        if !engineStatus.isEmpty {
+            menu.addItem(withTitle: engineStatus, action: nil, keyEquivalent: "").isEnabled = false
+            menu.addItem(.separator())
+        }
         let toggleTitle: String
         switch state {
         case .idle: toggleTitle = "Toggle Recording"
@@ -1365,6 +1381,28 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Plain osascript notification: no UserNotifications entitlement dance needed.
         let esc = { (s: String) in s.replacingOccurrences(of: "\"", with: "\\\"") }
         _ = run("/usr/bin/osascript", ["-e", "display notification \"\(esc(body))\" with title \"\(esc(title))\""])
+    }
+}
+
+// Headless: fetch (or reuse) llama-server + the Llama GGUF, print progress,
+// exit 0 when ready. `--ensure-llm <dir>` installs under <dir> instead of
+// ~/.config/whisper and always downloads (support tool and test hook).
+if let i = CommandLine.arguments.firstIndex(of: "--ensure-llm") {
+    let args = CommandLine.arguments
+    let custom = args.count > i + 1 && !args[i + 1].hasPrefix("-")
+    let base = custom ? URL(fileURLWithPath: args[i + 1], isDirectory: true) : Config.dir
+    print("Installing under \(base.path)")
+    switch LocalLLM.ensure(baseDir: base, reuseDebrief: !custom, onStatus: { print($0); fflush(stdout) }) {
+    case .ready:
+        print("ready: \(LocalLLM.llamaServer(baseDir: base).path)")
+        print("ready: \(LocalLLM.gguf(baseDir: base).path)")
+        if !custom {
+            print("notes dir: \(Meeting.notesDir(cfg: Config.load()).path)")
+        }
+        exit(0)
+    case .failed(let msg):
+        print("failed: \(msg)")
+        exit(1)
     }
 }
 

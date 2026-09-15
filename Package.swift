@@ -26,6 +26,7 @@ let package = Package(
                 "icon",
                 "Whisper.app",
                 "com.maxoleary.whisper.plist",
+                "VERSION",
             ],
             swiftSettings: [
                 .swiftLanguageMode(.v5)
